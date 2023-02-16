@@ -1,0 +1,27 @@
+name: pfaf-data
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - beautifulsoup4
+  - aiohttp-client-cache
+  - rich
+  - click
+  - eralchemy
+  - datasette
+  - rich-click
+  - typer
+  - conda-lock
+  - mypy
+  - black
+  - pip
+  - pip:
+      - datasette-render-images
+      - datasette-gzip
+  # Speedups for aiohttp
+  - brotli
+  - aiodns
+  # Speedup for bs4
+  - lxml
+  # For conda lock pip support
+  - poetry=1.1

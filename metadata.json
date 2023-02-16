@@ -1,0 +1,11 @@
+{
+  "title": "(unofficial) Plants for a Future Data",
+  "source": "github.com/saulshanabrook/pfaf-data",
+  "license_url": "https://pfaf.org/user/cmspage.aspx?pageid=136",
+  "source_url": "https://github.com/saulshanabrook/pfaf-data",
+  "plugins": {
+    "datasette-render-images": {
+      "size_limit": 1000000
+    }
+  }
+}
