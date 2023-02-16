@@ -20,11 +20,7 @@ We use Datasette to create a website to display the data. To start it locally ru
 $ datasette data.sqlite -m metadata.json
 ```
 
-We also [host a version on Heroku](https://pfaf-data.herokuapp.com/). To updated the hosted version run:
-
-```console
-$ python main.py publish
-```
+You can also [browse the dataset entirely in your browser using Datasette Lite](https://lite.datasette.io/?url=https://saulshanabrook.github.io/pfaf-data/data.sqlite#/data/plant_data)
 
 ## Development
 
