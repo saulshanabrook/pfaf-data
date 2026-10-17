@@ -12,10 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_published_database():
     with sqlite3.connect((ROOT / "data.sqlite").as_uri() + "?mode=ro", uri=True) as con:
+        if hasattr(con, "setconfig"):
+            con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+            con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
         assert con.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert con.execute("PRAGMA foreign_key_check").fetchall() == []
         count = con.execute("SELECT count(*) FROM plants").fetchone()[0]
-        assert count >= 8504
+        assert count >= 8796
         assert con.execute("SELECT count(*) FROM plant_data").fetchone()[0] == count
         cols = {row[1] for row in con.execute("PRAGMA table_info(plant_data)")}
         assert {"native_range", "source_url", "details_scraped_at", "cares"} <= cols
