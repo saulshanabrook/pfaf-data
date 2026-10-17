@@ -18,8 +18,8 @@ uv run datasette data.sqlite -m metadata.json
 ```
 
 Open the local URL printed by Datasette. `.python-version` selects Python 3.15;
-uv downloads it if necessary. Python 3.11 and newer are supported, with 3.11,
-3.14, and 3.15 tested in CI. `pyproject.toml` declares dependencies and `uv.lock`
+uv downloads it if necessary. Python 3.11 and newer are supported; CI runs on
+Ubuntu with the Python version pinned in `.python-version`. `pyproject.toml` declares dependencies and `uv.lock`
 pins their versions across platforms. The lock uses stable releases, including
 Datasette 0.65.5; Datasette 1.0 prereleases are excluded.
 
