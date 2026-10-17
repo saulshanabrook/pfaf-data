@@ -1,69 +1,37 @@
-"""
-Scrapes PFAF webisite for all plants
+"""Explicit, resumable commands for scraping the Plants For A Future database."""
 
-
-We employ two levels of caching:
-
-1. Request level caching, enabled for all requests besides the images and two
-   startup requests. This is stored in `cache.sqlite`.
-2. Row level caching. If a plant already has details filled in, then skip creating it.
-
-"""
 from __future__ import annotations
 
-import logging
-from asyncio import create_subprocess_exec, gather, run
+import argparse
+import asyncio
+import re
+import sqlite3
+from collections.abc import AsyncIterator
 from contextlib import closing
-from pathlib import Path
-from sqlite3 import Connection, connect
-from typing import AsyncIterable, Awaitable, Literal, Optional, cast
-from urllib.parse import urljoin
-from warnings import warn
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlencode, urljoin, urlparse
 
-from aiohttp import ClientTimeout, TCPConnector, TraceConfig
-from aiohttp_client_cache import CachedSession, SQLiteBackend
-from bs4 import BeautifulSoup
-from eralchemy import render_er
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import (
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskID,
-    TimeElapsedColumn,
+from aiohttp import (
+    ClientConnectionError,
+    ClientResponseError,
+    ClientTimeout,
+    TCPConnector,
 )
-from rich.traceback import install
-from rich_click.cli import console
-from rich_click.typer import Context, Option, Typer
+from aiohttp_client_cache import CachedSession, SQLiteBackend
+from bs4 import BeautifulSoup, NavigableString, Tag
+from rich.console import Console
+from rich.progress import track
 
-##
-# Constants
-##
-
-PUBLISH_COMMAND = [
-    "datasette",
-    "publish",
-    "heroku",
-    "-m" "metadata.json",
-    "--install",
-    "datasette-hashed-urls",
-    "--install",
-    "datasette-gzip",
-    "--extra-options",
-    "--setting max_returned_rows 100000 --setting sql_time_limit_ms 60000",
-    "-n",
-    "pfaf-data",
-    "data.sqlite",
-]
-
-# Total number of search result pages, determined through manual search
-N_SEARCH_PAGES = 86
-
-# Database file
-DB_FILE = "data.sqlite"
-
-# Mapping of table names to columns, to use for CREATE_TABLE
+SITE_URL = "https://pfaf.org/user/"
+SEARCH_URL = urljoin(SITE_URL, "DatabaseSearhResult.aspx")
+PLANT_URL = urljoin(SITE_URL, "Plant.aspx")
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; pfaf-data; +https://github.com/saulshanabrook/pfaf-data)"
+)
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+console = Console()
 TABLES = {
     "plants": {
         # From search page
@@ -80,9 +48,8 @@ TABLES = {
         "medicinal_rating": "INTEGER",
         "other_uses_rating": "INTEGER",
         # From detail page table
-        # We let the rest be null, so that we can fill in just the search
-        # details at first. If any of the following are null, we haven't
-        # loaded the plant page yet.
+        # Detail fields are nullable until fetched. details_scraped_at records
+        # source freshness independently of whether optional fields are empty.
         "family": "TEXT",
         "known_hazards": "TEXT",
         "habitats": "TEXT",
@@ -105,6 +72,10 @@ TABLES = {
         "expert_comment": "TEXT",
         "author": "TEXT",
         "botanical_references": "TEXT",
+        # Current website terminology and refresh provenance.
+        "native_range": "TEXT",
+        "source_url": "TEXT",
+        "details_scraped_at": "TEXT",
     },
     "plant_care": {
         "plant": "TEXT NOT NULL",
@@ -141,629 +112,623 @@ TABLES = {
     },
 }
 
+# Correlated aggregates return [] for missing relations and avoid multiplying rows
+# when a plant has several images, care requirements, and uses.
 VIEWS = {
     "plant_data": """
-with cares as (
-  select
-    p.latin_name,
-    json_group_array(c.care) cares
-  from
-    plants p
-    left join plant_care c on p.latin_name = c.plant
-  group by
-    p.latin_name
-),
-images as (
-  select
-    p.latin_name,
-    json_group_array(json_object('url', i.url, 'source', i.source)) images
-  from
-    plants p
-    left join plant_images i on p.latin_name = i.plant
-  group by
-    p.latin_name
-),
-uses as (
-  select
-    p.latin_name,
-    json_group_array(
-      json_object('category', u.category, 'name', u.name)
-    ) uses
-  from
-    plants p
-    left join plant_uses u on p.latin_name = u.plant
-  group by
-    p.latin_name
-)
-select
-  *
-from
-  plants
-  join images using (latin_name)
-  join uses using (latin_name)
-order by
-  common_name IS "",
-  trim(common_name, "'")
+SELECT p.*,
+    (SELECT json_group_array(care)
+       FROM plant_care WHERE plant = p.latin_name) AS cares,
+    (SELECT json_group_array(json_object('url', url, 'source', source))
+       FROM plant_images WHERE plant = p.latin_name) AS images,
+    (SELECT json_group_array(json_object('category', category, 'name', name))
+       FROM plant_uses WHERE plant = p.latin_name) AS uses
+FROM plants AS p
+ORDER BY common_name = '', trim(common_name, '''')
 """
 }
 
-app = Typer(chain=True)
-console = Console()
+SEARCH_COLUMNS = (
+    "latin_name",
+    "common_name",
+    "habit",
+    "height",
+    "hardiness",
+    "growth",
+    "soil",
+    "shade",
+    "moisture",
+    "edibility_rating",
+    "medicinal_rating",
+    "other_uses_rating",
+)
+SEARCH_HEADINGS = (
+    "Latin Name",
+    "Common Name",
+    "Habit",
+    "Height",
+    "Hardiness",
+    "Growth",
+    "Soil",
+    "Shade",
+    "Moisture",
+    "Edible",
+    "Medicinal",
+    "Other",
+)
+DETAIL_FIELDS = {
+    "common_name": "lblCommanName",
+    "hardiness": "lblUSDAhardiness",
+    "family": "lblFamily",
+    "known_hazards": "lblKnownHazards",
+    "habitats": "txtHabitats",
+    "range": "lblRange",
+    "weed_potential": "lblWeedPotential",
+    "summary": "txtSummary",
+    "physical_characteristics": "lblPhystatment",
+    "synonyms": "lblSynonyms",
+    "habitats_section": "lblhabitats",
+    "propagation": "txtPropagation",
+    "other_names": "lblOtherNameText",
+    # Keep the historical column available to existing queries and exports.
+    "found_in": "lblFoundInText",
+    "weed_potential_section": "lblWeedPotentialText",
+    "conservation_status": "lblConservationStatus",
+    "author": "txtAuthor",
+    "botanical_references": "lblbiorefer",
+}
+USE_SECTIONS = {
+    "medicinal uses": "txtMediUses",
+    "other uses": "txtOtherUses",
+    "cultivation": "txtCultivationDetails",
+    "special uses": "txtSpecialUses",
+}
 
-# Set async on call
-con: Connection
-progress: Progress
-session: CachedSession
 
-##
-# Commands
-##
+@dataclass
+class FetchedPage:
+    soup: BeautifulSoup
+    fetched_at: datetime
 
 
-async def main(tasks: list[Awaitable[None]]) -> None:
-    global con, progress, session
-    with Progress(
-        SpinnerColumn(),
-        *Progress.get_default_columns(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        # refresh_per_second=1,
-        expand=True,
-    ) as progress:
-        task = progress.add_task("Scraping PFAF...", start=False, total=len(tasks))
-
-        with closing(connect(DB_FILE)) as con:
-            con.execute("PRAGMA foreign_keys = ON")
-            async with CachedSession(
-                # Limit to 10 max requests at once to host, to not overwhelm
-                connector=TCPConnector(limit_per_host=10),
-                # No timeouts
-                timeout=ClientTimeout(total=None),
-                trace_configs=[rich_trace_config(progress)],
-                cache=SQLiteBackend(
-                    "cache",
-                    # Cache all requests to individual plants and search pages
-                    allowed_methods=("GET", "POST"),
-                    # Don't cache based on viewstate
-                    ignored_params=["__VIEWSTATE"],
-                ),
-            ) as session:
-                progress.start_task(task)
-                for c in tasks:
-                    await c
-                    progress.advance(task)
+@dataclass
+class PlantDetails:
+    values: dict[str, str | int | None]
+    care: dict[str, str]
+    images: dict[str, str | None]
+    uses: dict[str, dict[str, str]]
 
 
-def tear_down(tasks, force):
-    run(
-        main(
-            tasks
-            or [
-                create_tables(force),
-                draw_tables(),
-                search_plants(),
-                load_plants(force),
-                load_images(),
-                publish(),
-            ]
+def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
+    """Create or additively migrate the schema, preserving existing plant rows."""
+    # SQLite's legacy transaction mode does not BEGIN for DDL. A savepoint
+    # makes the entire migration atomic and also supports an outer transaction.
+    con.execute("SAVEPOINT pfaf_schema")
+    try:
+        for name in VIEWS:
+            con.execute(f"DROP VIEW IF EXISTS {name}")
+        if force:
+            for name in (
+                "plant_care",
+                "plant_images",
+                "plant_uses",
+                "care",
+                "uses",
+                "plants",
+            ):
+                con.execute(f"DROP TABLE IF EXISTS {name}")
+        for name, columns in TABLES.items():
+            definitions = ", ".join(
+                f"{column} {kind}" for column, kind in columns.items()
+            )
+            con.execute(f"CREATE TABLE IF NOT EXISTS {name} ({definitions})")
+        columns = {row[1] for row in con.execute("PRAGMA table_info(plants)")}
+        for name in ("native_range", "source_url", "details_scraped_at"):
+            if name not in columns:
+                con.execute(f"ALTER TABLE plants ADD COLUMN {name} TEXT")
+        for name, query in VIEWS.items():
+            con.execute(f"CREATE VIEW {name} AS {query}")
+    except BaseException:
+        con.execute("ROLLBACK TO SAVEPOINT pfaf_schema")
+        con.execute("RELEASE SAVEPOINT pfaf_schema")
+        raise
+    else:
+        con.execute("RELEASE SAVEPOINT pfaf_schema")
+
+
+def parse_search_page(soup: BeautifulSoup) -> list[dict[str, str | int | float | None]]:
+    """Validate the result layout before interpreting positional search columns."""
+    table = soup.find(id="ContentPlaceHolder1_gvresults")
+    if table is None:
+        raise ValueError(
+            "PFAF search results table is missing; the website may have changed"
         )
+    rows = table.find_all("tr", recursive=False)
+    if not rows:
+        raise ValueError("PFAF search results table is empty")
+    headings = tuple(
+        cell.get_text(" ", strip=True)
+        for cell in rows[0].find_all(["th", "td"], recursive=False)
     )
-
-
-@app.callback(result_callback=tear_down, invoke_without_command=True)
-def setup(
-    ctx: Context, force: bool = Option(False, help="Force recreating all computation")
-):
-    """
-    Scrape the Plants for a Future website into the data.sqlite file.
-    """
-    pass
-
-
-@app.command()
-async def create_tables(
-    force: bool = Option(False, help="Force recreating the tables, even if they exist"),
-):
-    """
-    Create the tables.
-    """
-    if force:
-        for name in reversed(TABLES.keys()):
-            con.execute(f"DROP TABLE IF EXISTS {name}")
-    for name, cols in TABLES.items():
-        cols_txt = ",".join(f"{name} {tp}" for name, tp in cols.items())
-        query = f"CREATE TABLE IF NOT EXISTS {name} ({cols_txt})"
-        con.execute(query)
-    # Always drop all views and recreate
-    for name in VIEWS.keys():
-        con.execute(f"DROP VIEW IF EXISTS {name}")
-    for name, select in VIEWS.items():
-        query = f"CREATE VIEW {name} AS {select}"
-        con.execute(query)
-
-
-@app.command()
-async def draw_tables():
-    """
-    Exports the tables as an image.
-    """
-    render_er(f"sqlite:///{DB_FILE}", "diagram.png")
-
-
-@app.command()
-async def search_plants():
-    """
-    Search all the plants and save them to the DB.
-    """
-    search_pages_task = progress.add_task(
-        "Fetching search pages...", total=N_SEARCH_PAGES
-    )
-    async for page in get_all_search_pages():
-        progress.update(search_pages_task, advance=1)
-        for row in get_plant_rows_from_search_page(page):
-            record_plant_row(row)
-
-
-@app.command()
-async def load_plants(
-    force: bool = Option(
-        False, help="Force loading plants, even if they have already been loaded"
-    )
-):
-    """
-    Load the plant detail pages.
-    """
-    query = "SELECT latin_name FROM plants"
-    # If we are not forcing, only select rows where the family as not been filled in
-    if not force:
-        query += " WHERE family IS NULL"
-    plants = [name for name, in con.execute(query)]
-    search_pages_task = progress.add_task("Fetching plants...", total=len(plants))
-    tasks = [load_plant(search_pages_task, name) for name in plants]
-    await gather(*tasks)
-
-
-@app.command()
-async def load_images():
-    """
-    Load the image contents.
-    """
-    urls_and_paths = [
-        (url, path)
-        for url, path_str in con.execute("SELECT url, path FROM plant_images")
-        if not (path := Path(path_str)).exists()
-    ]
-    task = progress.add_task("Downloading images...", total=len(urls_and_paths))
-
-    tasks = [download_file(task, url, path) for url, path in urls_and_paths]
-    await gather(*tasks)
-
-
-@app.command()
-async def publish():
-    """
-    Push the app to heroku.
-    """
-    p = await create_subprocess_exec(*PUBLISH_COMMAND)
-    await p.wait()
-
-
-async def download_file(task: TaskID, url: str, path: Path) -> None:
-    async with session.get(url) as r:
-        if r.status != 200:
-            warn(f"Cannot load {url}")
-            return
-        path.write_bytes(await r.read())
-    progress.update(task, advance=1, description=url)
-
-
-##
-# Helper functions
-##
-
-
-async def get_all_search_pages() -> AsyncIterable[BeautifulSoup]:
-    """
-    Returns all the pages of search results, fetched synchronously.
-    Cannot fetch in parallel, otherwise will mess up form logic.
-    """
-    # Don't cache the first search, so that we have fresh cookies and view state.
-    async with session.disabled():
-        # First, get the homepage to setup the cookies and get the view_state
-        view_state = get_view_state(
-            await request_soup(session, "GET", "https://pfaf.org/user/Default.aspx")
+    if headings != SEARCH_HEADINGS:
+        raise ValueError(f"Unexpected PFAF search columns: {headings!r}")
+    plants = []
+    for row in rows[1:]:
+        # ASP.NET pager rows also contain td elements, but no plant link.
+        if row.find("a", href=re.compile(r"Plant\.aspx\?")) is None:
+            continue
+        cells = row.find_all("td", recursive=False)
+        if len(cells) != len(SEARCH_COLUMNS):
+            raise ValueError(
+                f"Unexpected PFAF plant row: {row.get_text(' ', strip=True)!r}"
+            )
+        plant = dict(
+            zip(SEARCH_COLUMNS, (cell.get_text(" ", strip=True) for cell in cells))
         )
-
-        # Then, send a search request for all plants with a " " in their names
-        # (should be all plants)
-        first_search_page = await request_soup(
-            session,
-            "POST",
-            "https://pfaf.org/user/Default.aspx",
-            # Through trial and error, deduced that we need these data to be sent
-            # Copied from request in browser
-            data={
-                "__VIEWSTATE": view_state,
-                "__SCROLLPOSITIONX": 0,
-                "__SCROLLPOSITIONY": 687,
-                "ctl00$ContentPlaceHolder1$txtSearch": " ",
-                "ctl00$ContentPlaceHolder1$imgbtnSearch1.x": 47,
-                "ctl00$ContentPlaceHolder1$imgbtnSearch1.y": 8,
-            },
-        )
-    yield first_search_page
-
-    # Update the view state to the one from the form
-    view_state = get_view_state(first_search_page)
-
-    # Get the remaining search pages
-    for i in range(2, N_SEARCH_PAGES + 1):
-        yield await request_soup(
-            session,
-            "POST",
-            "https://pfaf.org/user/DatabaseSearhResult.aspx",
-            data={
-                "__VIEWSTATE": view_state,
-                "__VIEWSTATEGENERATOR": "C7892775",
-                "ctl00$ContentPlaceHolder1$txtword": "",
-                "__EVENTTARGET": "ctl00$ContentPlaceHolder1$gvresults",
-                "__EVENTARGUMENT": f"Page${i}",
-            },
-        )
-
-
-def get_plant_rows_from_search_page(search_page: BeautifulSoup) -> list[BeautifulSoup]:
-    """
-    Get all the plant rows from each plant page.
-    """
-    header, *plants, footer = search_page.find(
-        id="ContentPlaceHolder1_gvresults"
-    ).find_all("tr", recursive=False)
+        plant["height"] = float(plant["height"])
+        for name in SEARCH_COLUMNS[-3:]:
+            plant[name] = int(plant[name]) if plant[name] else None
+        plants.append(plant)
     return plants
 
 
-def record_plant_row(plant: BeautifulSoup) -> None:
-    """
-    Parses a plant row into plant data and a set of common namse
-    """
-    (
-        latin_name,
-        common_name,
-        habit,
-        height,
-        hardiness,
-        growth,
-        soil,
-        shade,
-        moisture,
-        edible,
-        medicinal,
-        other,
-    ) = (
-        cast(str, col.get_text()).strip()
-        for col in plant.find_all("td", recursive=False)
-    )
+def record_plant_row(con: sqlite3.Connection, plant: dict) -> None:
+    """Refresh every discovery field without replacing detail data or relations."""
+    columns = ", ".join(SEARCH_COLUMNS)
+    assignments = ", ".join(f"{name}=excluded.{name}" for name in SEARCH_COLUMNS[1:])
+    placeholders = ", ".join("?" for _ in SEARCH_COLUMNS)
     with con:
-        # Create a plant for this row, if it exists, update it.
         con.execute(
-            """INSERT INTO plants(
-            latin_name,
-            common_name,
-            habit,
-            height,
-            hardiness,
-            growth,
-            soil,
-            shade,
-            moisture,
-            edibility_rating,
-            medicinal_rating,
-            other_uses_rating
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO UPDATE SET
-            habit=excluded.habit,
-            height=excluded.height,
-            hardiness=excluded.hardiness,
-            growth=excluded.growth,
-            soil=excluded.soil,
-            moisture=excluded.moisture,
-            edibility_rating=excluded.edibility_rating,
-            medicinal_rating=excluded.medicinal_rating,
-            other_uses_rating=excluded.other_uses_rating""",
-            (
-                latin_name,
-                common_name,
-                habit,
-                float(height),
-                hardiness,
-                growth,
-                soil,
-                shade,
-                moisture,
-                int(edible) if (edible := edible.strip()) else None,
-                int(medicinal) if (medicinal := medicinal.strip()) else None,
-                int(other_s) if (other_s := other.strip()) else None,
-            ),
+            f"INSERT INTO plants ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT(latin_name) DO UPDATE SET {assignments}",
+            [plant[name] for name in SEARCH_COLUMNS],
         )
 
 
-async def load_plant(task_id: TaskID, latin_name: str) -> None:
-    """
-    Parse the plant details from the plant row in a search page, by also visiting
-    the plant detail page.
-    """
-    base_url = "https://pfaf.org/user/Plant.aspx"
-    soup = await request_soup(
-        session,
-        "GET",
-        base_url,
-        params={"LatinName": latin_name},
-    )
-    # Verify the latin name is the same
-    title = soup.find(id="ContentPlaceHolder1_lbldisplatinname").get_text().strip()
-    assert title.startswith(latin_name), latin_name
+def prose_without_glossary(section: Tag | None) -> str:
+    """Keep nested prose while removing the separate glossary/tag list."""
+    if section is None:
+        return ""
+    copy = BeautifulSoup(str(section), "lxml")
+    for link in copy.find_all("a", href=re.compile(r"Search_Use\.aspx", re.IGNORECASE)):
+        link.decompose()
+    text = " ".join(copy.stripped_strings)
+    text = re.sub(r"Edible (?:Parts|Uses):\s*", "", text)
+    return re.sub(r"\s+([,.;:!?])", r"\1", text).strip()
 
-    care_name_and_url = [
-        (c.get("title"), urljoin(base_url, c.get("src")))
-        for c in soup.find(id="ContentPlaceHolder1_tblIcons").find_all("img")
-    ]
-    images_to_sources: dict[str, Optional[str]] = {}
-    last_image: str
-    for row in soup.find(id="ContentPlaceHolder1_tblPlantImges").find_all(
-        "tr", recursive=False
-    ):
-        if img := row.find("img"):
-            url = urljoin(base_url, img.get("src"))
-            last_image = url
-            images_to_sources[url] = None
-        # If there wasn't an image, treat this as a source for the last image
-        else:
-            source = row.get_text().strip()
-            images_to_sources[last_image] = source
 
-    # Remove the no plant image, if that is in the images
-    images_to_sources.pop("https://pfaf.org/Admin/PlantImages/noplantimage1.JPG", None)
-    images_to_sources.pop("https://pfaf.org/Admin/PlantImages/noplantimage2.JPG", None)
-
-    uses: dict[
-        Literal[
-            "edible parts",
-            "edible uses",
-            "medicinal uses",
-            "other uses",
-            "special uses",
-            "cultivation",
-            "carbon farming",
-        ],
-        dict[str, str],
-    ] = {
-        name: {
-            e.get_text().strip(): e.get("title")
-            for e in soup.find(id=id_).find_all("a", recursive=False)
-        }
-        for name, id_ in cast(
-            dict[
-                Literal["other uses", "cultivation", "medicinal uses", "special uses"],
-                str,
-            ],
-            {
-                "other uses": "ContentPlaceHolder1_txtOtherUses",
-                "cultivation": "ContentPlaceHolder1_txtCultivationDetails",
-                "medicinal uses": "ContentPlaceHolder1_txtMediUses",
-                "special uses": "ContentPlaceHolder1_txtSpecialUses",
-            },
-        ).items()
-    }
-    uses["carbon farming"] = {
-        li.find("a").get_text(): " ".join(
-            txt.strip()
-            for txt in li.find_all(text=True, recursive=False)
-            if txt.strip()
+def parse_plant_page(
+    soup: BeautifulSoup, latin_name: str, fetched_at: datetime | None = None
+) -> PlantDetails:
+    """Parse optional sections independently; fail closed on the wrong plant."""
+    title = soup.find(id="ContentPlaceHolder1_lbldisplatinname")
+    title_text = title.get_text(" ", strip=True) if title else ""
+    if title_text != latin_name and not title_text.startswith(f"{latin_name} - "):
+        raise ValueError(
+            f"Requested {latin_name!r}, but PFAF returned title {title_text!r}"
         )
-        for li in soup.find(id="ContentPlaceHolder1_lblCarbFarm")
-        .parent.find_next_sibling("ul")
-        .find_all("li", recursive=False)
-    }
-
-    # The uses and parts are all links in the same span, separated by different prefixes
-    # Then follows the text description
-    edible_uses_paragraph = ""
-    current_use_category: dict[str, str]
-    for child in soup.find(id="ContentPlaceHolder1_txtEdibleUses"):
-        match child:
-            case str(m) if m.startswith("Edible Parts:"):
-                current_use_category = uses["edible parts"] = {}
-            case str(m) if m.startswith("Edible Uses:"):
-                current_use_category = uses["edible uses"] = {}
-            case str(m) if m.strip():
-                edible_uses_paragraph += m.strip().replace("\n", " ")
-            case elem if elem.name == "a":
-                current_use_category[elem.get_text().strip()] = elem.get("title")
-    medicinal_uses_paragraph = " ".join(
-        e.strip().replace("\n", " ")
-        for e in soup.find(id="ContentPlaceHolder1_txtMediUses").find_all(
-            text=True, recursive=False
-        )
-        if e.strip()
-    )
-    other_uses_paragraph = " ".join(
-        e.strip().replace("\n", " ")
-        for e in soup.find(id="ContentPlaceHolder1_txtOtherUses").find_all(
-            text=True, recursive=False
-        )
-        if e.strip()
-    )
-    cultivation_details_paragraph = " ".join(
-        e.strip().replace("\n", " ")
-        for e in soup.find(id="ContentPlaceHolder1_txtCultivationDetails").find_all(
-            text=True, recursive=False
-        )
-        if e.strip()
-    )
-    plant_row = (
-        soup.find(id="ContentPlaceHolder1_lblFamily").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblKnownHazards").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_txtHabitats").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblRange").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblWeedPotential").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_txtSummary").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblPhystatment").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblSynonyms").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblhabitats").get_text().strip(),
-        edible_uses_paragraph,
-        medicinal_uses_paragraph,
-        other_uses_paragraph,
-        cultivation_details_paragraph,
-        soup.find(id="ContentPlaceHolder1_txtPropagation").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblOtherNameText").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblFoundInText").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblWeedPotentialText").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblConservationStatus")
-        .get_text()
+    if soup.find(id="ContentPlaceHolder1_lblFamily") is None:
+        raise ValueError(f"PFAF overview is missing for {latin_name!r}")
+    values = {}
+    for column, suffix in DETAIL_FIELDS.items():
+        node = soup.find(id=f"ContentPlaceHolder1_{suffix}")
+        values[column] = " ".join(node.stripped_strings) if node else ""
+    values["conservation_status"] = (
+        values["conservation_status"]
         .removeprefix("IUCN Red List of Threatened Plants Status :")
-        .strip(),
-        soup.find(text="Expert comment")
-        .parent.find_next_sibling("div")
-        .get_text()
-        .strip(),
-        soup.find(id="ContentPlaceHolder1_txtAuthor").get_text().strip(),
-        soup.find(id="ContentPlaceHolder1_lblbiorefer").get_text().strip(),
-        latin_name,
+        .strip()
     )
+    native_heading = soup.find(
+        ["h2", "h3"], string=re.compile(r"^\s*Native Range\s*$", re.IGNORECASE)
+    )
+    values["native_range"] = values["found_in"] if native_heading else None
+    values["source_url"] = f"{PLANT_URL}?{urlencode({'LatinName': latin_name})}"
+    values["details_scraped_at"] = (fetched_at or datetime.now(timezone.utc)).isoformat(
+        timespec="seconds"
+    )
+    for column, suffix in {
+        "edibility_rating": "txtEdrating",
+        "medicinal_rating": "txtMedRating",
+        "other_uses_rating": "txtOtherUseRating",
+    }.items():
+        node = soup.find(id=f"ContentPlaceHolder1_{suffix}")
+        if node and (match := re.search(r"\((\d+) of 5\)", node.get_text())):
+            values[column] = int(match[1])
+    expert_heading = soup.find(
+        ["h2", "h3"], string=re.compile(r"^\s*Expert comment\s*$", re.IGNORECASE)
+    )
+    expert = expert_heading.find_next_sibling() if expert_heading else None
+    values["expert_comment"] = (
+        " ".join(expert.stripped_strings) if expert and expert.name == "div" else ""
+    )
+
+    care = {}
+    icons = soup.find(id="ContentPlaceHolder1_tblIcons")
+    if icons:
+        for icon in icons.find_all("img", src=True):
+            name = (icon.get("title") or icon.get("alt") or "").strip()
+            if name:
+                care[name] = urljoin(PLANT_URL, icon["src"])
+
+    images = {}
+    image_table = soup.find(id="ContentPlaceHolder1_tblPlantImges")
+    last_image = None
+    if image_table:
+        for row in image_table.find_all("tr", recursive=False):
+            photos = row.find_all("img", src=True)
+            if photos:
+                for photo in photos:
+                    url = urljoin(PLANT_URL, photo["src"])
+                    if (
+                        urlparse(url)
+                        .path.rsplit("/", 1)[-1]
+                        .lower()
+                        .startswith("noplantimage")
+                    ):
+                        last_image = None
+                        continue
+                    last_image = url
+                    images[url] = None
+            elif last_image and (source := row.get_text(" ", strip=True)):
+                images[last_image] = source
+
+    uses = {
+        category: {}
+        for category in ("edible parts", "edible uses", *USE_SECTIONS, "carbon farming")
+    }
+    edible = soup.find(id="ContentPlaceHolder1_txtEdibleUses")
+    category = None
+    if edible:
+        for child in edible.descendants:
+            if isinstance(child, NavigableString):
+                if "Edible Parts:" in child:
+                    category = "edible parts"
+                if "Edible Uses:" in child:
+                    category = "edible uses"
+            elif (
+                child.name == "a"
+                and category
+                and "Search_Use.aspx" in child.get("href", "")
+            ):
+                name = child.get_text(" ", strip=True)
+                if name:
+                    uses[category][name] = child.get("title") or ""
+    values["edible_uses"] = prose_without_glossary(edible)
+    for category, suffix in USE_SECTIONS.items():
+        section = soup.find(id=f"ContentPlaceHolder1_{suffix}")
+        if section:
+            for link in section.find_all(
+                "a", href=re.compile(r"Search_Use\.aspx", re.IGNORECASE)
+            ):
+                if name := link.get_text(" ", strip=True):
+                    uses[category][name] = link.get("title") or ""
+        if category != "special uses":
+            column = (
+                "cultivation_details"
+                if category == "cultivation"
+                else category.replace(" ", "_")
+            )
+            values[column] = prose_without_glossary(section)
+    carbon = soup.find(id="ContentPlaceHolder1_lblCarbFarm")
+    # The current site often leaves an empty h3 with no list at all.
+    carbon_list = carbon.parent.find_next_sibling() if carbon else None
+    if carbon_list and carbon_list.name == "ul":
+        for item in carbon_list.find_all("li", recursive=False):
+            link = item.find("a")
+            if link:
+                name = link.get_text(" ", strip=True)
+                description = (
+                    " ".join(item.stripped_strings).removeprefix(name).strip(" :-")
+                )
+                uses["carbon farming"][name] = description
+    return PlantDetails(values, care, images, uses)
+
+
+def record_plant_details(
+    con: sqlite3.Connection, latin_name: str, details: PlantDetails
+) -> None:
+    """Replace a plant's detail relations atomically after successful parsing."""
     with con:
-        # Add plant details
-        con.execute(
-            """UPDATE plants SET
-                family = ?,
-                known_hazards = ?,
-                habitats = ?,
-                range = ?,
-                weed_potential = ?,
-                summary = ?,
-                physical_characteristics = ?,
-                synonyms = ?,
-                habitats_section = ?,
-                edible_uses = ?,
-                medicinal_uses = ?,
-                other_uses = ?,
-                cultivation_details = ?,
-                propagation = ?,
-                other_names = ?,
-                found_in = ?,
-                weed_potential_section = ?,
-                conservation_status = ?,
-                expert_comment = ?,
-                author = ?,
-                botanical_references = ?
-        WHERE latin_name = ?""",
-            plant_row,
+        result = con.execute(
+            f"UPDATE plants SET {', '.join(f'{name}=?' for name in details.values)} WHERE latin_name=?",
+            [*details.values.values(), latin_name],
         )
-        # Add cares, if not already exists, and update URLs
+        if result.rowcount != 1:
+            raise ValueError(f"Plant {latin_name!r} is absent; run search-plants first")
         con.executemany(
-            "INSERT INTO care(name, icon_url) VALUES(?, ?) ON CONFLICT DO UPDATE SET icon_url=excluded.icon_url",
-            care_name_and_url,
+            "INSERT INTO care(name, icon_url) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET icon_url=excluded.icon_url",
+            details.care.items(),
         )
-        # Remove all existing plant cares for this plant
         con.execute("DELETE FROM plant_care WHERE plant=?", (latin_name,))
-        # Add new plant cares
         con.executemany(
-            "INSERT INTO plant_care(plant, care) VALUES(?, ?)",
-            [(latin_name, care_name) for care_name, url in care_name_and_url],
+            "INSERT INTO plant_care VALUES (?, ?)",
+            [(latin_name, name) for name in details.care],
         )
-
-        # Remove existing plant images
         con.execute("DELETE FROM plant_images WHERE plant=?", (latin_name,))
-
-        # Add plant images
         con.executemany(
-            "INSERT INTO plant_images(plant, url, path, source) VALUES(?, ?, ?, ?) ON CONFLICT DO UPDATE SET source=excluded.source",
+            "INSERT INTO plant_images(plant, url, path, source) VALUES (?, ?, ?, ?)",
             [
                 (
                     latin_name,
-                    image,
+                    url,
                     str(
-                        Path("images")
-                        / url.removeprefix("https://pfaf.org/Admin/PlantImages/")
+                        PurePosixPath("images")
+                        / PurePosixPath(unquote(urlparse(url).path)).name
                     ),
                     source,
                 )
-                for image, source in images_to_sources.items()
+                for url, source in details.images.items()
             ],
         )
-        # Add uses
         con.executemany(
-            "INSERT INTO uses(category, name, description) VALUES(?, ?, ?) ON CONFLICT DO UPDATE SET description=excluded.description",
+            "INSERT INTO uses(category, name, description) VALUES (?, ?, ?) "
+            "ON CONFLICT(category, name) DO UPDATE SET description=excluded.description",
             [
                 (category, name, description)
-                for category, names_and_description in uses.items()
-                for name, description in names_and_description.items()
+                for category, names in details.uses.items()
+                for name, description in names.items()
             ],
         )
-        # remove existing plant uses
         con.execute("DELETE FROM plant_uses WHERE plant=?", (latin_name,))
-        # Add plant uses
         con.executemany(
-            "INSERT INTO plant_uses(plant, category, name) VALUES(?, ?, ?)",
+            "INSERT INTO plant_uses VALUES (?, ?, ?)",
             [
                 (latin_name, category, name)
-                for category, names_and_description in uses.items()
-                for name in names_and_description.keys()
+                for category, names in details.uses.items()
+                for name in names
             ],
         )
-    progress.update(task_id, advance=1, description=latin_name)
 
 
-def get_view_state(soup: BeautifulSoup) -> str:
-    """
-    Get the view state from a page.
-    """
-    return soup.find("input", {"name": "__VIEWSTATE"}).get("value")
-
-
-async def request_soup(
+async def request_page(
     session: CachedSession, method: str, url: str, **kwargs
-) -> BeautifulSoup:
-    """
-    Request a URL and parse the body as HTML
-    """
-    async with session.request(method, url, **kwargs) as r:
-        r.raise_for_status()
-        html = await r.text()
-        return BeautifulSoup(html, "lxml")
+) -> FetchedPage:
+    """Use finite timeouts and bounded retries for transient upstream failures."""
+    for attempt in range(3):
+        try:
+            async with session.request(method, url, **kwargs) as response:
+                response.raise_for_status()
+                soup = BeautifulSoup(await response.text(), "lxml")
+                fetched_at = (
+                    response.created_at
+                    if getattr(response, "from_cache", False)
+                    else datetime.now(timezone.utc)
+                )
+                # aiohttp-client-cache stores created_at as naive UTC.
+                if fetched_at.tzinfo is None:
+                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                return FetchedPage(soup, fetched_at)
+        except (
+            ClientConnectionError,
+            ClientResponseError,
+            asyncio.TimeoutError,
+        ) as error:
+            if (
+                isinstance(error, ClientResponseError)
+                and error.status not in RETRYABLE_HTTP_STATUSES
+            ):
+                raise
+            if attempt == 2:
+                raise
+            await asyncio.sleep(attempt + 1)
+    raise AssertionError("unreachable")
 
 
-def rich_trace_config(progress: Progress) -> TraceConfig:
-    """
-    Create a trace config which traces all the requests to rich.
-    """
-    trace_config = TraceConfig()
-    n_requests = 0
-    all_requests_task = progress.add_task("Visiting pages...", total=n_requests)
+async def get_all_search_pages(
+    session: CachedSession, query: str = "%"
+) -> AsyncIterator[BeautifulSoup]:
+    """Use the public index and follow any advertised ASP.NET pager dynamically."""
+    page = (
+        await request_page(session, "GET", SEARCH_URL, params={"LatinName": query})
+    ).soup
+    page_number = 1
+    while True:
+        yield page
+        targets = []
+        for link in page.select("#ContentPlaceHolder1_gvresults a[href]"):
+            match = re.search(
+                r"__doPostBack\('([^']+)','Page\$(\d+|Next)'\)", link["href"]
+            )
+            if match and (match[2] == "Next" or int(match[2]) == page_number + 1):
+                targets.append((match[1], match[2]))
+        if not targets:
+            return
+        form_state = {
+            node["name"]: node.get("value", "")
+            for node in page.select('input[type="hidden"][name]')
+        }
+        if "__VIEWSTATE" not in form_state:
+            raise ValueError("PFAF pagination is missing ASP.NET form state")
+        target, argument = targets[0]
+        form_state.update(__EVENTTARGET=target, __EVENTARGUMENT=f"Page${argument}")
+        # Hidden state and cookie context must come from the immediately prior page.
+        async with session.disabled():
+            next_page = (
+                await request_page(
+                    session,
+                    "POST",
+                    SEARCH_URL,
+                    params={"LatinName": query},
+                    data=form_state,
+                )
+            ).soup
+        if [p["latin_name"] for p in parse_search_page(next_page)] == [
+            p["latin_name"] for p in parse_search_page(page)
+        ]:
+            raise ValueError("PFAF pagination repeated the previous page; stopping")
+        page, page_number = next_page, page_number + 1
 
-    @trace_config.on_request_start.append
-    async def on_request_start(session, trace_config_ctx, params):
-        nonlocal n_requests
-        n_requests += 1
-        progress.update(all_requests_task, total=n_requests, advance=0)
 
-    @trace_config.on_request_exception.append
-    async def on_request_exception(session, trace_config_ctx, params):
-        progress.update(all_requests_task, advance=1)
+async def run_network_command(
+    args: argparse.Namespace, con: sqlite3.Connection
+) -> None:
+    async with CachedSession(
+        headers={"User-Agent": USER_AGENT},
+        connector=TCPConnector(limit_per_host=2),
+        timeout=ClientTimeout(total=60),
+        cache=SQLiteBackend(
+            str(args.cache), expire_after=86400, disabled=args.no_cache
+        ),
+    ) as session:
+        if args.command == "search-plants":
+            count = 0
+            async for page in get_all_search_pages(session, args.query):
+                for plant in parse_search_page(page):
+                    record_plant_row(con, plant)
+                    count += 1
+                    if args.limit and count >= args.limit:
+                        console.print(f"Saved {count} search results")
+                        return
+            console.print(f"Saved {count} search results")
+        elif args.command == "load-plants":
+            conditions, parameters = [], []
+            if args.plant:
+                conditions.append(
+                    f"latin_name IN ({', '.join('?' for _ in args.plant)})"
+                )
+                parameters.extend(args.plant)
+            if not args.force:
+                conditions.append("details_scraped_at IS NULL")
+            query = "SELECT latin_name FROM plants"
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY latin_name"
+            if args.limit:
+                query += " LIMIT ?"
+                parameters.append(args.limit)
+            plants = [row[0] for row in con.execute(query, parameters)]
+            if args.plant:
+                existing = {
+                    row[0] for row in con.execute("SELECT latin_name FROM plants")
+                }
+                missing = set(args.plant) - existing
+                if missing:
+                    raise ValueError(
+                        f"Plants absent from database: {sorted(missing)!r}; run search-plants first"
+                    )
+            updated, failed = 0, []
+            for name in track(plants, description="Fetching plants", console=console):
+                try:
+                    page = await request_page(
+                        session, "GET", PLANT_URL, params={"LatinName": name}
+                    )
+                    record_plant_details(
+                        con, name, parse_plant_page(page.soup, name, page.fetched_at)
+                    )
+                except (ValueError, ClientResponseError) as error:
+                    if (
+                        isinstance(error, ClientResponseError)
+                        and error.status in RETRYABLE_HTTP_STATUSES
+                    ):
+                        raise
+                    console.print(f"Failed {name}: {error}", markup=False)
+                    failed.append(name)
+                    continue
+                updated += 1
+            console.print(f"Updated {updated} plants")
+            if failed:
+                raise ValueError(
+                    f"Failed to update {len(failed)} plants: {', '.join(failed)}"
+                )
+        elif args.command == "load-images":
+            images = [
+                (url, args.database.parent / path)
+                for url, path in con.execute(
+                    "SELECT DISTINCT url, path FROM plant_images"
+                )
+            ]
+            images = [(url, path) for url, path in images if not path.exists()]
+            if args.limit:
+                images = images[: args.limit]
+            for url, path in track(
+                images, description="Downloading images", console=console
+            ):
+                # Avoid storing a second copy of every downloaded image in SQLite.
+                async with session.disabled(), session.get(url) as response:
+                    response.raise_for_status()
+                    body = await response.read()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+            console.print(f"Downloaded {len(images)} images")
 
-    @trace_config.on_request_end.append
-    async def on_request_end(session, trace_config_ctx, params):
-        progress.update(all_requests_task, advance=1)
 
-    return trace_config
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data.sqlite"),
+        help="SQLite database (default: data.sqlite)",
+    )
+    parser.add_argument(
+        "--cache", type=Path, default=Path("cache.sqlite"), help="HTTP cache file"
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Fetch fresh pages instead of using the HTTP cache",
+    )
+    commands = parser.add_subparsers(dest="command")
+    create = commands.add_parser(
+        "create-tables", help="Create tables or add new columns, preserving data"
+    )
+    create.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete existing data and recreate all tables",
+    )
+    search = commands.add_parser(
+        "search-plants", help="Discover plant names and search fields"
+    )
+    search.add_argument(
+        "--query",
+        default="%",
+        help="Public Latin-name search query (default: all names)",
+    )
+    load = commands.add_parser("load-plants", help="Fetch plant detail pages")
+    load.add_argument(
+        "--plant", action="append", help="Only this exact Latin name; may be repeated"
+    )
+    load.add_argument(
+        "--force", action="store_true", help="Refresh previously fetched details"
+    )
+    images = commands.add_parser(
+        "load-images", help="Download missing images alongside the database"
+    )
+    for command in (search, load, images):
+        command.add_argument(
+            "--limit", type=int, help="Maximum number of records to process"
+        )
+    diagram = commands.add_parser(
+        "draw-tables", help="Render an ER diagram (requires the diagram extra)"
+    )
+    diagram.add_argument("--output", type=Path, default=Path("diagram.png"))
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return
+    if getattr(args, "limit", None) is not None and args.limit < 1:
+        parser.error("--limit must be positive")
+    try:
+        with closing(sqlite3.connect(args.database)) as con:
+            con.execute("PRAGMA foreign_keys = ON")
+            create_tables(con, force=args.command == "create-tables" and args.force)
+            if args.command == "draw-tables":
+                from eralchemy import render_er
+
+                render_er(f"sqlite:///{args.database.resolve()}", str(args.output))
+            elif args.command != "create-tables":
+                asyncio.run(run_network_command(args, con))
+    except (
+        ValueError,
+        ClientConnectionError,
+        ClientResponseError,
+        asyncio.TimeoutError,
+        sqlite3.Error,
+    ) as error:
+        parser.exit(1, f"Error: {error}\n")
 
 
 if __name__ == "__main__":
-    # Install rich logger
-    logging.basicConfig(
-        level="WARNING", format="%(message)s", datefmt="[%X]", handlers=[RichHandler()]
-    )
-    # Install rich traceback handler
-    install(show_locals=True, console=console, width=None)
-
-    app()
+    main()
