@@ -81,6 +81,8 @@ and care information. It is useful for export and local Datasette queries.
 The default Lite link opens `plants`, which avoids the browser query timeout
 seen with the original aggregate view.
 
+![ERD database diagram](diagram.png)
+
 `diagram.png` shows the current schema. To regenerate it after a schema change,
 install [Graphviz](https://graphviz.org/download/) and run:
 
