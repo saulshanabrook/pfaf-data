@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 
-from aiohttp import ClientResponseError, ClientTimeout, TCPConnector
+from aiohttp import (
+    ClientConnectionError,
+    ClientResponseError,
+    ClientTimeout,
+    TCPConnector,
+)
 from aiohttp_client_cache import CachedSession, SQLiteBackend
 from bs4 import BeautifulSoup, NavigableString, Tag
 from rich.console import Console
@@ -25,6 +30,7 @@ PLANT_URL = urljoin(SITE_URL, "Plant.aspx")
 USER_AGENT = (
     "Mozilla/5.0 (compatible; pfaf-data; +https://github.com/saulshanabrook/pfaf-data)"
 )
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 console = Console()
 TABLES = {
     "plants": {
@@ -118,7 +124,7 @@ SELECT p.*,
     (SELECT json_group_array(json_object('category', category, 'name', name))
        FROM plant_uses WHERE plant = p.latin_name) AS uses
 FROM plants AS p
-ORDER BY common_name = '', trim(common_name, "'")
+ORDER BY common_name = '', trim(common_name, '''')
 """
 }
 
@@ -493,14 +499,15 @@ async def request_page(
                 if fetched_at.tzinfo is None:
                     fetched_at = fetched_at.replace(tzinfo=timezone.utc)
                 return FetchedPage(soup, fetched_at)
-        except (ClientResponseError, asyncio.TimeoutError) as error:
-            if isinstance(error, ClientResponseError) and error.status not in {
-                429,
-                500,
-                502,
-                503,
-                504,
-            }:
+        except (
+            ClientConnectionError,
+            ClientResponseError,
+            asyncio.TimeoutError,
+        ) as error:
+            if (
+                isinstance(error, ClientResponseError)
+                and error.status not in RETRYABLE_HTTP_STATUSES
+            ):
                 raise
             if attempt == 2:
                 raise
@@ -600,14 +607,30 @@ async def run_network_command(
                     raise ValueError(
                         f"Plants absent from database: {sorted(missing)!r}; run search-plants first"
                     )
+            updated, failed = 0, []
             for name in track(plants, description="Fetching plants", console=console):
-                page = await request_page(
-                    session, "GET", PLANT_URL, params={"LatinName": name}
+                try:
+                    page = await request_page(
+                        session, "GET", PLANT_URL, params={"LatinName": name}
+                    )
+                    record_plant_details(
+                        con, name, parse_plant_page(page.soup, name, page.fetched_at)
+                    )
+                except (ValueError, ClientResponseError) as error:
+                    if (
+                        isinstance(error, ClientResponseError)
+                        and error.status in RETRYABLE_HTTP_STATUSES
+                    ):
+                        raise
+                    console.print(f"Failed {name}: {error}", markup=False)
+                    failed.append(name)
+                    continue
+                updated += 1
+            console.print(f"Updated {updated} plants")
+            if failed:
+                raise ValueError(
+                    f"Failed to update {len(failed)} plants: {', '.join(failed)}"
                 )
-                record_plant_details(
-                    con, name, parse_plant_page(page.soup, name, page.fetched_at)
-                )
-            console.print(f"Updated {len(plants)} plants")
         elif args.command == "load-images":
             images = [
                 (url, args.database.parent / path)
@@ -699,6 +722,7 @@ def main(argv: list[str] | None = None) -> None:
                 asyncio.run(run_network_command(args, con))
     except (
         ValueError,
+        ClientConnectionError,
         ClientResponseError,
         asyncio.TimeoutError,
         sqlite3.Error,

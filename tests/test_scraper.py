@@ -7,8 +7,11 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from aiohttp import ClientConnectionError, ClientResponseError
 from bs4 import BeautifulSoup
 
 import main
@@ -306,8 +309,6 @@ def test_repeated_pagination_page_is_an_error(monkeypatch):
 
 @pytest.mark.parametrize("from_cache", [True, False])
 def test_fetch_timestamp_tracks_source_age_not_cache_read_time(plant_page, from_cache):
-    from unittest.mock import AsyncMock, MagicMock
-
     cached_at = datetime(2020, 1, 2, 3, 4, 5)
     response = MagicMock(from_cache=from_cache, created_at=cached_at)
     response.text = AsyncMock(return_value=str(plant_page))
@@ -437,3 +438,224 @@ def test_failed_schema_migration_rolls_back_ddl_and_preserves_outer_transaction(
             database.execute("SELECT common_name FROM plants").fetchone()[0]
             == "Example plant"
         )
+
+
+@pytest.mark.parametrize(
+    "error", [ClientConnectionError("connection reset"), asyncio.TimeoutError()]
+)
+def test_request_recovers_after_transient_connection_failures(
+    plant_page, monkeypatch, error
+):
+    response = MagicMock(from_cache=False)
+    response.text = AsyncMock(return_value=str(plant_page))
+    context = AsyncMock()
+    context.__aenter__.return_value = response
+    session = MagicMock()
+    session.request.side_effect = [error, error, context]
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    page = asyncio.run(main.request_page(session, "GET", main.PLANT_URL))
+
+    assert (
+        main.parse_plant_page(page.soup, "Example alba").values["family"]
+        == "Exampleaceae"
+    )
+    assert session.request.call_count == 3
+    assert sleep.await_args_list == [call(1), call(2)]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 429, 500, 502, 503, 504])
+def test_request_retries_only_transient_http_statuses_with_three_attempt_limit(
+    monkeypatch, status
+):
+    error = ClientResponseError(
+        request_info=SimpleNamespace(real_url=main.PLANT_URL),
+        history=(),
+        status=status,
+        message="Test response",
+    )
+    response = MagicMock()
+    response.raise_for_status.side_effect = error
+    context = AsyncMock()
+    context.__aenter__.return_value = response
+    session = MagicMock()
+    session.request.return_value = context
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    with pytest.raises(ClientResponseError) as failure:
+        asyncio.run(main.request_page(session, "GET", main.PLANT_URL))
+
+    assert failure.value is error
+    retryable = status in {429, 500, 502, 503, 504}
+    assert session.request.call_count == (3 if retryable else 1)
+    assert sleep.await_args_list == ([call(1), call(2)] if retryable else [])
+
+
+def test_exhausted_connection_failures_exit_cli_cleanly_after_three_attempts(
+    tmp_path, monkeypatch, capsys
+):
+    session = MagicMock()
+    session.request.side_effect = ClientConnectionError("connection refused")
+    context = AsyncMock()
+    context.__aenter__.return_value = session
+    monkeypatch.setattr(main, "CachedSession", MagicMock(return_value=context))
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(tmp_path / "test.sqlite"),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "search-plants",
+                "--limit",
+                "1",
+            ]
+        )
+
+    assert failure.value.code == 1
+    assert session.request.call_count == 3
+    assert sleep.await_args_list == [call(1), call(2)]
+    captured = capsys.readouterr()
+    assert captured.err == "Error: connection refused\n"
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_load_batch_reports_bad_plants_continues_and_commits_only_success(
+    tmp_path, plant_page, monkeypatch, capsys
+):
+    path = tmp_path / "test.sqlite"
+    names = ("Example alba", "Example beta", "Example gamma")
+    with sqlite3.connect(path) as database:
+        main.create_tables(database)
+        for plant in main.parse_search_page(search_html(names)):
+            main.record_plant_row(database, plant)
+        database.execute("UPDATE plants SET family='Original family'")
+    malformed = BeautifulSoup("<h1>Not a plant page</h1>", "lxml")
+    plant_page.find(
+        id="ContentPlaceHolder1_lbldisplatinname"
+    ).string = "Example gamma - A. Author"
+    fetched_at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+    missing = ClientResponseError(
+        request_info=SimpleNamespace(real_url=main.PLANT_URL),
+        history=(),
+        status=404,
+        message="Not Found",
+    )
+    request = AsyncMock(
+        side_effect=[
+            main.FetchedPage(malformed, fetched_at),
+            missing,
+            main.FetchedPage(plant_page, fetched_at),
+        ]
+    )
+    monkeypatch.setattr(main, "request_page", request)
+
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(path),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "load-plants",
+            ]
+        )
+
+    assert failure.value.code == 1
+    assert [
+        args.kwargs["params"]["LatinName"] for args in request.await_args_list
+    ] == list(names)
+    captured = capsys.readouterr()
+    assert "Failed Example alba:" in captured.out
+    assert "Failed Example beta: 404" in captured.out
+    assert "Updated 1 plants" in captured.out
+    assert (
+        captured.err == "Error: Failed to update 2 plants: Example alba, Example beta\n"
+    )
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT latin_name, family, details_scraped_at FROM plants ORDER BY latin_name"
+        ).fetchall() == [
+            ("Example alba", "Original family", None),
+            ("Example beta", "Original family", None),
+            ("Example gamma", "Exampleaceae", fetched_at.isoformat(timespec="seconds")),
+        ]
+        assert database.execute("SELECT DISTINCT plant FROM plant_uses").fetchall() == [
+            ("Example gamma",)
+        ]
+        assert database.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_load_batch_aborts_after_exhausted_retryable_http_failure(
+    tmp_path, plant_page, monkeypatch, capsys
+):
+    path = tmp_path / "test.sqlite"
+    with sqlite3.connect(path) as database:
+        main.create_tables(database)
+        for plant in main.parse_search_page(search_html()):
+            main.record_plant_row(database, plant)
+    error = ClientResponseError(
+        request_info=SimpleNamespace(real_url=main.PLANT_URL),
+        history=(),
+        status=503,
+        message="Service Unavailable",
+    )
+    request = AsyncMock(
+        side_effect=[error, main.FetchedPage(plant_page, datetime.now(timezone.utc))]
+    )
+    monkeypatch.setattr(main, "request_page", request)
+
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(path),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "load-plants",
+            ]
+        )
+
+    assert failure.value.code == 1
+    assert request.await_count == 1
+    captured = capsys.readouterr()
+    assert "Error: 503" in captured.err
+    assert "Updated" not in captured.out and "Failed Example" not in captured.out
+    with sqlite3.connect(path) as database:
+        assert (
+            database.execute(
+                "SELECT count(*) FROM plants WHERE details_scraped_at IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_plant_data_view_works_with_double_quoted_string_literals_disabled():
+    if not hasattr(sqlite3.Connection, "setconfig") or not hasattr(
+        sqlite3, "SQLITE_DBCONFIG_DQS_DML"
+    ):
+        pytest.skip(
+            "SQLite DQS configuration requires Python 3.12 and a supporting SQLite build"
+        )
+    with sqlite3.connect(":memory:") as database:
+        database.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+        database.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        main.create_tables(database)
+        for plant, common_name in zip(
+            main.parse_search_page(
+                search_html(("Example alba", "Example beta", "Example gamma"))
+            ),
+            ("'Zulu'", "'Alpha'", ""),
+        ):
+            plant["common_name"] = common_name
+            main.record_plant_row(database, plant)
+        assert database.execute("SELECT latin_name FROM plant_data").fetchall() == [
+            ("Example beta",),
+            ("Example alba",),
+            ("Example gamma",),
+        ]
