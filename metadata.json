@@ -1,6 +1,6 @@
 {
   "title": "(unofficial) Plants for a Future Data",
-  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. details_scraped_at records individual detail refreshes and is null when the date is unknown.",
+  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. Detail and photo metadata have independent fetch timestamps. The plant_data image array exposes successfully refreshed associations with verified downloads; underlying tables retain pending work and failures.",
   "source": "github.com/saulshanabrook/pfaf-data",
   "license_url": "https://pfaf.org/user/cmspage.aspx?pageid=136",
   "source_url": "https://github.com/saulshanabrook/pfaf-data",
@@ -11,7 +11,36 @@
           "columns": {
             "native_range": "The current PFAF Native Range section; found_in is retained for compatibility.",
             "source_url": "PFAF detail page used for this record.",
-            "details_scraped_at": "UTC ISO 8601 time of the last successful detail fetch. Null means unknown; cached responses do not advance this time."
+            "details_scraped_at": "UTC ISO 8601 time of the last successful detail fetch. Null means unknown; cached responses do not advance this time.",
+            "images_scraped_at": "UTC ISO 8601 time of the last successful photo metadata fetch, including pages with no photos. Independent of details_scraped_at; cached responses retain their original time.",
+            "images_error": "Last photo metadata refresh error. Earlier associations are retained for inspection and excluded from the public image array until a successful refresh."
+          }
+        },
+        "plant_images": {
+          "description": "Source-listed photo associations and credits. A planned path does not establish a successful download; consult image_downloads and the plant photo refresh fields.",
+          "columns": {
+            "url": "PFAF source photo URL, retained independently of the local file path.",
+            "path": "Planned local path allocated to this URL by the download ledger, relative to the archive root.",
+            "source": "Photo credit text from the PFAF page."
+          }
+        },
+        "image_downloads": {
+          "description": "One record per source URL. Files are reusable only when their recorded hash matches and format verification and full pixel decoding succeed. Failed attempts preserve earlier successful download information for inspection.",
+          "columns": {
+            "url": "Source URL whose downloaded bytes establish image identity.",
+            "path": "Allocated local path. Safe source filenames are preserved; unsafe or conflicting names receive a URL hash filename.",
+            "path_key": "Unicode-normalized, case-folded path key with a unique index to prevent portable filename collisions.",
+            "status": "pending: not completed or interrupted; ok: successfully fetched and validated; error: last attempt failed. Only ok assets from successfully refreshed plant pages appear in plant_data.images.",
+            "sha256": "SHA-256 of the bytes from the last successful download. An error status can retain an earlier hash.",
+            "byte_size": "Byte count from the last successful download.",
+            "fetched_at": "UTC ISO 8601 time of the last successful image fetch.",
+            "attempted_at": "UTC ISO 8601 time at which the latest download attempt started.",
+            "error": "Last download or validation error; null for successful or pending attempts."
+          }
+        },
+        "plant_data": {
+          "columns": {
+            "images": "JSON array of verified photo entries from successfully refreshed plant pages. Each entry contains the original PFAF url, source credit text, and relative local path. Resolve path against the published archive root for the direct photo URL."
           }
         }
       }
