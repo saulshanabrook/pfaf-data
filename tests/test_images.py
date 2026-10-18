@@ -424,9 +424,10 @@ def test_public_view_requires_fresh_metadata_and_verified_ledger(
         image = json.loads(con.execute("SELECT images FROM plant_data").fetchone()[0])[
             0
         ]
-        assert image["url"] == "https://example.test/a.png" and image[
-            "path"
-        ] == main.image_path(image["url"])
+        assert (
+            image["url"] == "https://example.test/a.png"
+            and image["path"] == "images/a.png"
+        )
         con.execute("UPDATE plants SET images_error='Source unavailable'")
         assert con.execute("SELECT images FROM plant_data").fetchone()[0] == "[]"
     session = network([])
@@ -613,3 +614,76 @@ def test_bad_png_checksum_is_reported_without_cancelling_other_downloads(
         assert con.execute(
             "SELECT status FROM image_downloads ORDER BY url"
         ).fetchall() == [("error",), ("ok",)]
+
+
+def test_ledger_preserves_safe_names_and_allocates_collision_fallbacks():
+    with sqlite3.connect(":memory:") as con:
+        main.create_tables(con)
+        first = "https://example.test/first/Photo.jpg"
+        second = "https://example.test/second/photo.jpg"
+        assert main.allocate_image_path(con, first) == "images/Photo.jpg"
+        fallback = main.allocate_image_path(con, second)
+        assert fallback == main.image_path(second)
+        assert main.allocate_image_path(con, first) == "images/Photo.jpg"
+        assert main.allocate_image_path(con, second) == fallback
+        # NFC normalization protects filesystems that normalize Unicode names.
+        composed = "https://example.test/\u00e9.jpg"
+        decomposed = "https://example.test/e\u0301.jpg"
+        assert main.allocate_image_path(con, composed) == "images/\u00e9.jpg"
+        assert main.allocate_image_path(con, decomposed) == main.image_path(decomposed)
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO image_downloads(url,path,path_key) VALUES(?,?,?)",
+                ("other", "images/other.jpg", "images/photo.jpg"),
+            )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CON.jpg",
+        "aux.png",
+        "bad%5Cname.jpg",
+        "trailing.",
+        "trailing%20",
+        "bad%3Aname.png",
+        "x" * 201 + ".jpg",
+    ],
+)
+def test_unsafe_source_names_use_safe_url_hash_fallback(name):
+    url = "https://example.test/" + name
+    with sqlite3.connect(":memory:") as con:
+        main.create_tables(con)
+        assert main.allocate_image_path(con, url) == main.image_path(url)
+
+
+def test_existing_ledger_path_and_status_survive_schema_upgrade(archive):
+    path = archive(["https://example.test/a.png"])
+    with sqlite3.connect(path) as con:
+        con.execute("DROP TABLE image_downloads")
+        # Reproduce the initial full-URL-hash checkpoint without path_key.
+        definitions = ", ".join(
+            f"{name} {kind}"
+            for name, kind in main.TABLES["image_downloads"].items()
+            if name != "path_key"
+        )
+        con.execute(f"CREATE TABLE image_downloads ({definitions})")
+        url = "https://example.test/a.png"
+        old_path = main.image_path(url)
+        con.execute(
+            "INSERT INTO image_downloads(url,path,status,sha256) VALUES(?,?,'ok','known-source-hash')",
+            (url, old_path),
+        )
+        main.create_tables(con)
+        assert con.execute(
+            "SELECT path,status,sha256,path_key FROM image_downloads"
+        ).fetchone() == (old_path, "ok", "known-source-hash", old_path.casefold())
+        assert con.execute("SELECT path FROM plant_images").fetchone()[0] == old_path
+        assert main.allocate_image_path(con, url) == old_path
+
+
+def test_photo_parser_preserves_existing_url_identity_for_spaces_and_unicode():
+    raw = """<span id="ContentPlaceHolder1_lbldisplatinname">Example alba</span><span id="ContentPlaceHolder1_lblFamily">Family</span><table id="ContentPlaceHolder1_tblPlantImges"><tr><td><img src='../Admin/PlantImages/Example alba \u00e9.jpg'></td></tr></table>"""
+    assert list(main.parse_plant_images(main.parse_page_html(raw), "Example alba")) == [
+        "https://pfaf.org/Admin/PlantImages/Example alba \u00e9.jpg"
+    ]

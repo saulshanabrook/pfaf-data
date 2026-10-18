@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import closing
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from html import escape, unescape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
-from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
+from urllib.parse import unquote, urlencode, urljoin, urlparse
 
 from aiohttp import (
     ClientConnectionError,
@@ -109,6 +110,7 @@ TABLES = {
     "image_downloads": {
         "url": "TEXT PRIMARY KEY NOT NULL",
         "path": "TEXT UNIQUE NOT NULL",
+        "path_key": "TEXT NOT NULL",
         "status": "TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ok','error'))",
         "sha256": "TEXT",
         "byte_size": "INTEGER",
@@ -247,6 +249,58 @@ def image_path(url: str) -> str:
     )
 
 
+def allocate_image_path(con: sqlite3.Connection, url: str) -> str:
+    """Preserve safe basenames while the ledger prevents portable path collisions."""
+    con.execute("SAVEPOINT pfaf_image_path")
+    try:
+        existing = con.execute(
+            "SELECT path FROM image_downloads WHERE url=?", (url,)
+        ).fetchone()
+        if existing:
+            path = existing[0]
+        else:
+            name = unquote(PurePosixPath(urlparse(url).path).name)
+            safe = (
+                name not in {"", ".", ".."}
+                and len(name.encode("utf-8")) <= 200
+                and not name.endswith((".", " "))
+                and not any(ord(char) < 32 or char in '<>:"/\\|?*' for char in name)
+                and not re.match(
+                    r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)",
+                    name,
+                    re.IGNORECASE,
+                )
+            )
+            path = str(PurePosixPath("images") / name) if safe else image_path(url)
+            fallback = PurePosixPath(image_path(url))
+            counter = 0
+            while con.execute(
+                "SELECT 1 FROM image_downloads WHERE path_key=?",
+                (unicodedata.normalize("NFC", path).casefold(),),
+            ).fetchone():
+                counter += 1
+                path = (
+                    str(fallback)
+                    if counter == 1
+                    else str(
+                        fallback.with_name(
+                            f"{fallback.stem}-{counter}{fallback.suffix}"
+                        )
+                    )
+                )
+            con.execute(
+                "INSERT INTO image_downloads(url,path,path_key) VALUES(?,?,?)",
+                (url, path, unicodedata.normalize("NFC", path).casefold()),
+            )
+    except BaseException:
+        con.execute("ROLLBACK TO SAVEPOINT pfaf_image_path")
+        con.execute("RELEASE SAVEPOINT pfaf_image_path")
+        raise
+    else:
+        con.execute("RELEASE SAVEPOINT pfaf_image_path")
+    return path
+
+
 def parse_page_html(body: bytes | str) -> BeautifulSoup:
     """Repair PFAF's unescaped filename apostrophes using the original attribute text."""
     text = UnicodeDammit(body).unicode_markup
@@ -298,9 +352,9 @@ def parse_plant_images(soup: BeautifulSoup, latin_name: str) -> dict[str, str | 
                         raise ValueError(
                             f"PFAF photo has no source URL for {latin_name!r}"
                         )
-                    url = quote(
-                        urljoin(PLANT_URL, photo["src"]), safe=":/?&=%+;,@!$()*[]#"
-                    )
+                    # Keep existing source URL identities, including spaces;
+                    # aiohttp encodes them for HTTP. Escape the recovered quotes.
+                    url = urljoin(PLANT_URL, photo["src"]).replace("'", "%27")
                     if (
                         PurePosixPath(urlparse(url).path)
                         .name.lower()
@@ -332,11 +386,7 @@ def record_plant_images(
             raise ValueError(f"Plant {latin_name!r} is absent; run search-plants first")
         con.execute("DELETE FROM plant_images WHERE plant=?", (latin_name,))
         for url, source in images.items():
-            path = image_path(url)
-            con.execute(
-                "INSERT INTO image_downloads(url,path) VALUES(?,?) ON CONFLICT(url) DO NOTHING",
-                (url, path),
-            )
+            path = allocate_image_path(con, url)
             con.execute(
                 "INSERT INTO plant_images(plant,url,path,source) VALUES(?,?,?,?)",
                 (latin_name, url, path, source),
@@ -409,12 +459,26 @@ def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
         ):
             if name not in columns:
                 con.execute(f"ALTER TABLE plants ADD COLUMN {name} TEXT")
-        for (url,) in con.execute("SELECT DISTINCT url FROM plant_images").fetchall():
-            path = image_path(url)
+        download_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(image_downloads)")
+        }
+        if "path_key" not in download_columns:
+            con.execute("ALTER TABLE image_downloads ADD COLUMN path_key TEXT")
+        for url, path in con.execute(
+            "SELECT url,path FROM image_downloads WHERE path_key IS NULL"
+        ).fetchall():
             con.execute(
-                "INSERT INTO image_downloads(url,path) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET path=excluded.path",
-                (url, path),
+                "UPDATE image_downloads SET path_key=? WHERE url=?",
+                (unicodedata.normalize("NFC", path).casefold(), url),
             )
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS image_downloads_path_key ON image_downloads(path_key)"
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS plant_images_url ON plant_images(url)")
+        for (url,) in con.execute(
+            "SELECT DISTINCT url FROM plant_images ORDER BY url"
+        ).fetchall():
+            path = allocate_image_path(con, url)
             con.execute("UPDATE plant_images SET path=? WHERE url=?", (path, url))
         for name, query in VIEWS.items():
             con.execute(f"CREATE VIEW {name} AS {query}")
