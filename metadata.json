@@ -17,7 +17,7 @@
           }
         },
         "image_downloads": {
-          "description": "Per-URL local paths, SHA-256 hashes, sizes, timestamps, and pending/ok/error download status. Only successful downloads from checked plant pages appear in plant_data.images."
+          "description": "Per-URL local paths, SHA-256 hashes, timestamps, and pending/ok/error download status. Only successful downloads from checked plant pages appear in plant_data.images."
         },
         "plant_data": {
           "columns": {

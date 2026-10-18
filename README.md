@@ -88,7 +88,7 @@ all existing records have been fetched again.
 
 `images_scraped_at` and `images_error` track photo refreshes independently of
 `details_scraped_at`. `plant_images` holds source URLs, credits, and local paths;
-`image_downloads` records per-URL hashes, sizes, fetch times, and download status.
+`image_downloads` records per-URL hashes, fetch times, and download status.
 
 The `plant_data` view combines plant details with JSON arrays of uses, images,
 and care information. Its `images` entries contain the original `url`, credit
