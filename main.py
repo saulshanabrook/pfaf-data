@@ -332,7 +332,9 @@ def parse_plant_images(soup: BeautifulSoup, latin_name: str) -> dict[str, str | 
     """Validate plant identity and preserve image-to-credit pairing by table column."""
     title = soup.find(id="ContentPlaceHolder1_lbldisplatinname")
     title_text = title.get_text(" ", strip=True) if title else ""
-    if title_text != latin_name and not title_text.startswith(f"{latin_name} - "):
+    if title_text not in {latin_name, f"{latin_name} -"} and not title_text.startswith(
+        f"{latin_name} - "
+    ):
         raise ValueError(
             f"Requested {latin_name!r}, but PFAF returned title {title_text!r}"
         )

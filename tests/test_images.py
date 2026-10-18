@@ -687,3 +687,16 @@ def test_photo_parser_preserves_existing_url_identity_for_spaces_and_unicode():
     assert list(main.parse_plant_images(main.parse_page_html(raw), "Example alba")) == [
         "https://pfaf.org/Admin/PlantImages/Example alba \u00e9.jpg"
     ]
+
+
+@pytest.mark.parametrize(
+    "name", ["Ericameria nauseosa ssp. consimilis", "Ericameria nauseosa ssp. nauseosa"]
+)
+def test_photo_page_accepts_empty_author_without_accepting_wrong_or_empty_title(name):
+    raw = f'<span id="ContentPlaceHolder1_lbldisplatinname">{name} - </span><span id="ContentPlaceHolder1_lblFamily">Asteraceae</span><table id="ContentPlaceHolder1_tblPlantImges"></table>'
+    soup = main.parse_page_html(raw)
+    assert main.parse_plant_images(soup, name) == {}
+    for title in ["Other plant -", ""]:
+        soup.find(id="ContentPlaceHolder1_lbldisplatinname").string = title
+        with pytest.raises(ValueError, match="returned title"):
+            main.parse_plant_images(soup, name)
