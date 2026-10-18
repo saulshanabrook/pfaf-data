@@ -183,10 +183,8 @@ def test_detail_refresh_is_atomic_and_relations_do_not_duplicate(con, plant_page
     main.record_plant_details(con, "Example alba", details)
     main.record_plant_details(con, "Example alba", details)
     assert con.execute("SELECT count(*) FROM plant_images").fetchone()[0] == 1
-    assert (
-        con.execute("SELECT path FROM plant_images").fetchone()[0]
-        == "images/Example alba.jpg"
-    )
+    url, path = con.execute("SELECT url,path FROM plant_images").fetchone()
+    assert path == main.image_path(url)
     assert con.execute("SELECT count(*) FROM plant_uses").fetchone()[0] == 6
     previous = con.execute("SELECT summary FROM plants").fetchone()[0]
     details.values["summary"] = "Should roll back"

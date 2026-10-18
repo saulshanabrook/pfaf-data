@@ -8,7 +8,6 @@ import hashlib
 import os
 import re
 import sqlite3
-import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import closing
 from dataclasses import dataclass
@@ -110,12 +109,9 @@ TABLES = {
     "image_downloads": {
         "url": "TEXT PRIMARY KEY NOT NULL",
         "path": "TEXT UNIQUE NOT NULL",
-        "path_key": "TEXT NOT NULL",
         "status": "TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ok','error'))",
         "sha256": "TEXT",
-        "byte_size": "INTEGER",
         "fetched_at": "TEXT",
-        "attempted_at": "TEXT",
         "error": "TEXT",
     },
     "plant_uses": {
@@ -245,60 +241,9 @@ def image_path(url: str) -> str:
     }:
         suffix = ".img"
     return str(
-        PurePosixPath("images") / (hashlib.sha256(url.encode()).hexdigest() + suffix)
+        PurePosixPath("images/by-url")
+        / (hashlib.sha256(url.encode()).hexdigest() + suffix)
     )
-
-
-def allocate_image_path(con: sqlite3.Connection, url: str) -> str:
-    """Preserve safe basenames while the ledger prevents portable path collisions."""
-    con.execute("SAVEPOINT pfaf_image_path")
-    try:
-        existing = con.execute(
-            "SELECT path FROM image_downloads WHERE url=?", (url,)
-        ).fetchone()
-        if existing:
-            path = existing[0]
-        else:
-            name = unquote(PurePosixPath(urlparse(url).path).name)
-            safe = (
-                name not in {"", ".", ".."}
-                and len(name.encode("utf-8")) <= 200
-                and not name.endswith((".", " "))
-                and not any(ord(char) < 32 or char in '<>:"/\\|?*' for char in name)
-                and not re.match(
-                    r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)",
-                    name,
-                    re.IGNORECASE,
-                )
-            )
-            path = str(PurePosixPath("images") / name) if safe else image_path(url)
-            fallback = PurePosixPath(image_path(url))
-            counter = 0
-            while con.execute(
-                "SELECT 1 FROM image_downloads WHERE path_key=?",
-                (unicodedata.normalize("NFC", path).casefold(),),
-            ).fetchone():
-                counter += 1
-                path = (
-                    str(fallback)
-                    if counter == 1
-                    else str(
-                        fallback.with_name(
-                            f"{fallback.stem}-{counter}{fallback.suffix}"
-                        )
-                    )
-                )
-            con.execute(
-                "INSERT INTO image_downloads(url,path,path_key) VALUES(?,?,?)",
-                (url, path, unicodedata.normalize("NFC", path).casefold()),
-            )
-    except BaseException:
-        con.execute("ROLLBACK TO SAVEPOINT pfaf_image_path")
-        con.execute("RELEASE SAVEPOINT pfaf_image_path")
-        raise
-    else:
-        con.execute("RELEASE SAVEPOINT pfaf_image_path")
-    return path
 
 
 def parse_page_html(body: bytes | str) -> BeautifulSoup:
@@ -388,7 +333,14 @@ def record_plant_images(
             raise ValueError(f"Plant {latin_name!r} is absent; run search-plants first")
         con.execute("DELETE FROM plant_images WHERE plant=?", (latin_name,))
         for url, source in images.items():
-            path = allocate_image_path(con, url)
+            existing = con.execute(
+                "SELECT path FROM image_downloads WHERE url=?", (url,)
+            ).fetchone()
+            path = existing[0] if existing else image_path(url)
+            if existing is None:
+                con.execute(
+                    "INSERT INTO image_downloads(url,path) VALUES(?,?)", (url, path)
+                )
             con.execute(
                 "INSERT INTO plant_images(plant,url,path,source) VALUES(?,?,?,?)",
                 (latin_name, url, path, source),
@@ -401,7 +353,7 @@ def record_plant_images(
         con.execute("RELEASE SAVEPOINT pfaf_images")
 
 
-def validate_image(body: bytes) -> tuple[str, int]:
+def validate_image(body: bytes) -> str:
     """Verify format integrity and decode every frame before trusting or publishing bytes."""
     try:
         with Image.open(BytesIO(body)) as image:
@@ -417,7 +369,7 @@ def validate_image(body: bytes) -> tuple[str, int]:
         Image.DecompressionBombError,
     ) as error:
         raise ValueError(f"Invalid image: {error}") from error
-    return hashlib.sha256(body).hexdigest(), len(body)
+    return hashlib.sha256(body).hexdigest()
 
 
 async def request_page(
@@ -461,27 +413,7 @@ def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
         ):
             if name not in columns:
                 con.execute(f"ALTER TABLE plants ADD COLUMN {name} TEXT")
-        download_columns = {
-            row[1] for row in con.execute("PRAGMA table_info(image_downloads)")
-        }
-        if "path_key" not in download_columns:
-            con.execute("ALTER TABLE image_downloads ADD COLUMN path_key TEXT")
-        for url, path in con.execute(
-            "SELECT url,path FROM image_downloads WHERE path_key IS NULL"
-        ).fetchall():
-            con.execute(
-                "UPDATE image_downloads SET path_key=? WHERE url=?",
-                (unicodedata.normalize("NFC", path).casefold(), url),
-            )
-        con.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS image_downloads_path_key ON image_downloads(path_key)"
-        )
         con.execute("CREATE INDEX IF NOT EXISTS plant_images_url ON plant_images(url)")
-        for (url,) in con.execute(
-            "SELECT DISTINCT url FROM plant_images ORDER BY url"
-        ).fetchall():
-            path = allocate_image_path(con, url)
-            con.execute("UPDATE plant_images SET path=? WHERE url=?", (path, url))
         for name, query in VIEWS.items():
             con.execute(f"CREATE VIEW {name} AS {query}")
     except BaseException:
@@ -924,7 +856,7 @@ async def run_network_command(
                 url, relative, status, expected_hash = row
                 if not args.force and status == "ok" and expected_hash:
                     try:
-                        actual_hash, _ = validate_image(
+                        actual_hash = validate_image(
                             (args.database.parent / relative).read_bytes()
                         )
                         if actual_hash == expected_hash:
@@ -942,13 +874,13 @@ async def run_network_command(
                 path = args.database.parent / relative
                 with con:
                     con.execute(
-                        "UPDATE image_downloads SET status='pending',attempted_at=?,error=NULL WHERE url=?",
-                        (datetime.now(timezone.utc).isoformat(timespec="seconds"), url),
+                        "UPDATE image_downloads SET status='pending',error=NULL WHERE url=?",
+                        (url,),
                     )
                 try:
                     async with session.disabled():
                         content = await request_content(session, "GET", url)
-                    digest, size = validate_image(content.body)
+                    digest = validate_image(content.body)
                     path.parent.mkdir(parents=True, exist_ok=True)
                     temporary = None
                     try:
@@ -968,10 +900,9 @@ async def run_network_command(
                             temporary.unlink(missing_ok=True)
                     with con:
                         con.execute(
-                            "UPDATE image_downloads SET status='ok',sha256=?,byte_size=?,fetched_at=?,error=NULL WHERE url=?",
+                            "UPDATE image_downloads SET status='ok',sha256=?,fetched_at=?,error=NULL WHERE url=?",
                             (
                                 digest,
-                                size,
                                 content.fetched_at.isoformat(timespec="seconds"),
                                 url,
                             ),
