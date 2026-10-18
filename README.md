@@ -45,30 +45,20 @@ uv run python main.py refresh-images --force --concurrency 4
 uv run python main.py load-images --concurrency 4
 ```
 
-`refresh-images` checks photo URLs and credits independently of descriptions.
-A complete refresh visits all 8,796 plants, including the 292 names added by the
-index update. Without `--force`, it resumes plants whose photos have not been
-checked or whose last check failed. A successful page with no photos is also
-checkpointed. Use repeated `--plant NAME` arguments or `--limit N` for a bounded
-check. `--concurrency` bounds simultaneous requests and defaults to two.
+`refresh-images` updates photo URLs and credits without changing descriptions.
+Without `--force`, it resumes unchecked plants and failed refreshes, including
+checkpoints for pages with no photos. Use `--plant NAME` or `--limit N` for a
+bounded check. `--concurrency` defaults to two.
 
-`load-images` downloads current photo URLs and records their content hashes.
-It reuses a file only when its recorded SHA-256 matches and Pillow can verify
-and fully decode it. Transient HTTP, connection, timeout, and incomplete-response
-failures get up to three attempts. Validated downloads replace their target
-files atomically. Individual failures are recorded while other photos continue;
-the command exits with an error if any photo failed. Rerun normally to retry
-failed or unverified files, or use `load-images --force` to fetch every current
-URL again. Safe original filenames are preserved; the URL ledger assigns a hash
-filename when a name is unsafe or conflicts with another URL.
+`load-images` reuses files only after checking their recorded SHA-256 and full
+image decoding. Downloads retry transient failures up to three times and replace
+files atomically. Individual failures are recorded while later items continue;
+the commands exit non-zero if any item failed. Rerun to retry failures, or use
+`load-images --force` to fetch every current URL again.
 
-To update descriptions as well, run `load-plants`; `load-plants --force` revisits
-already populated records, and `--plant NAME` selects a specific plant.
-The HTTP cache retains responses for 24 hours. `--force` changes which records
-are selected; the global `--no-cache` option forces fresh HTTP requests, for
-example `uv run python main.py --no-cache refresh-images --force`.
-Cached responses retain their original fetch timestamp. Full refreshes make
-thousands of requests; review database and image changes before committing them.
+Run `load-plants` to update descriptions too. `--force` revisits populated records;
+the global `--no-cache` option bypasses the 24-hour HTTP cache. Cached responses
+retain their original fetch timestamp. Review data and image changes before committing.
 
 The search uses the current alphabetical index and discovers pagination from
 the response rather than assuming a fixed page count. Detail parsing tolerates
@@ -90,35 +80,20 @@ stored in SQLite.
 - `index.html` and `.nojekyll`: the GitHub Pages landing page and static publishing configuration.
 - `tests/`: offline parsing, migration, database integrity, and Datasette checks.
 
-Photo metadata was checked on 2026-10-18 UTC: 8,795 successful plant pages,
-12,370 unique photos downloaded and verified, and
-0 photo download failures. One retained legacy plant page is unavailable.
-See the [photo archive audit](PHOTO_AUDIT.md) for counts, repairs, and source errors.
-
 The current PFAF **Native Range** section is stored as `native_range`; `found_in`
 is retained for compatibility. `source_url` records the detail URL and
 `details_scraped_at` records the last successful detail refresh in UTC. A null
 timestamp means the refresh date is unknown. Adding columns does not imply that
 all existing records have been fetched again.
 
-`images_scraped_at` records the last successful photo metadata fetch, including
-pages with no photos. `images_error` records a failed check and preserves earlier
-associations for inspection. These fields are independent of
-`details_scraped_at`; refreshing photos leaves descriptions unchanged.
-
-`plant_images` stores source-listed URLs, credits, and planned local paths.
-`image_downloads` has one row per URL, with its allocated path, content SHA-256,
-byte count, fetch and attempt timestamps, and `pending`, `ok`, or `error` status.
-An interrupted attempt remains pending. Failed attempts retain their error and
-any previous successful hash; an association or existing filename alone does
-not establish a successful download.
+`images_scraped_at` and `images_error` track photo refreshes independently of
+`details_scraped_at`. `plant_images` holds source URLs, credits, and local paths;
+`image_downloads` records per-URL hashes, sizes, fetch times, and download status.
 
 The `plant_data` view combines plant details with JSON arrays of uses, images,
-and care information. Its `images` array includes only successfully refreshed
-photo associations whose downloads have `ok` status. Each entry retains the
-PFAF source `url` and credit text in `source`, and adds the relative local `path`.
-Failed source checks or downloads are available in the underlying tables and
-excluded from this array. The view is useful for export and local Datasette queries.
+and care information. Its `images` entries contain the original `url`, credit
+text in `source`, and local `path`, and include only successful source checks
+and verified downloads.
 The default Lite link opens `plants`, which avoids the browser query timeout
 seen with the original aggregate view.
 
@@ -172,9 +147,7 @@ merging, check the repository’s **Pages build and deployment** and open the
 - Give plants a stable source identifier independent of mutable Latin names,
   keeping names and synonyms as searchable attributes.
 - Introduce numbered schema migrations and record scrape runs, parser versions,
-  and HTML source hashes alongside the per-record URL and timestamp.
-- Add a foreign key from `plant_images.url` to `image_downloads.url` through a
-  numbered migration, then derive local paths from the ledger to remove duplication.
+  and source hashes alongside the per-record URL and timestamp.
 - Add FTS5 search for names and descriptive text if local search needs improve.
 - Publish dated database releases with checksums so consumers can pin a snapshot
   without downloading the image archive or repository history.
