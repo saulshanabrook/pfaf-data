@@ -586,3 +586,30 @@ def test_photo_association_update_rolls_back_on_storage_failure(archive):
             ).fetchone()[0]
             == 0
         )
+
+
+def test_bad_png_checksum_is_reported_without_cancelling_other_downloads(
+    archive, network, png, tmp_path
+):
+    damaged = bytearray(png)
+    offset = damaged.index(b"IDAT")
+    length = int.from_bytes(damaged[offset - 4 : offset], "big")
+    damaged[offset + 4 + length] ^= 1
+    path = archive(["https://example.test/a.png", "https://example.test/b.png"])
+    session = network([bytes(damaged), png])
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(path),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "load-images",
+            ]
+        )
+    assert failure.value.code == 1
+    assert session.request.call_count == 2
+    with sqlite3.connect(path) as con:
+        assert con.execute(
+            "SELECT status FROM image_downloads ORDER BY url"
+        ).fetchall() == [("error",), ("ok",)]

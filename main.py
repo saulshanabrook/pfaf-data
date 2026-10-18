@@ -360,6 +360,7 @@ def validate_image(body: bytes) -> tuple[str, int]:
     except (
         OSError,
         ValueError,
+        SyntaxError,
         UnidentifiedImageError,
         Image.DecompressionBombError,
     ) as error:
