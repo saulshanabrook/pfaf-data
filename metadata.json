@@ -1,6 +1,6 @@
 {
   "title": "(unofficial) Plants for a Future Data",
-  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. Detail and photo metadata have independent fetch timestamps. The plant_data image array exposes successfully refreshed associations with verified downloads; underlying tables retain pending work and failures.",
+  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. Detail and photo metadata have independent fetch timestamps. The plant_data image array exposes successfully refreshed associations with verified downloads; underlying tables retain pending work and failures. Photo audit 2026-10-18 UTC: 8,795 successful source pages, 12,370 verified current photos, 1 unavailable legacy page.",
   "source": "github.com/saulshanabrook/pfaf-data",
   "license_url": "https://pfaf.org/user/cmspage.aspx?pageid=136",
   "source_url": "https://github.com/saulshanabrook/pfaf-data",

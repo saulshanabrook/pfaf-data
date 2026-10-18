@@ -90,8 +90,10 @@ stored in SQLite.
 - `index.html` and `.nojekyll`: the GitHub Pages landing page and static publishing configuration.
 - `tests/`: offline parsing, migration, database integrity, and Datasette checks.
 
-<!-- PHOTO_REFRESH_RESULTS: Add the audited refresh date, plant/photo totals,
-     and any remaining source failures here before publication. -->
+Photo metadata was checked on 2026-10-18 UTC: 8,795 successful plant pages,
+12,370 unique photos downloaded and verified, and
+0 photo download failures. One retained legacy plant page is unavailable.
+See the [photo archive audit](PHOTO_AUDIT.md) for counts, repairs, and source errors.
 
 The current PFAF **Native Range** section is stored as `native_range`; `found_in`
 is retained for compatibility. `source_url` records the detail URL and
@@ -171,6 +173,8 @@ merging, check the repository’s **Pages build and deployment** and open the
   keeping names and synonyms as searchable attributes.
 - Introduce numbered schema migrations and record scrape runs, parser versions,
   and HTML source hashes alongside the per-record URL and timestamp.
+- Add a foreign key from `plant_images.url` to `image_downloads.url` through a
+  numbered migration, then derive local paths from the ledger to remove duplication.
 - Add FTS5 search for names and descriptive text if local search needs improve.
 - Publish dated database releases with checksums so consumers can pin a snapshot
   without downloading the image archive or repository history.
