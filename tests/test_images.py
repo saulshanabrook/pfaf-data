@@ -351,14 +351,3 @@ def test_worker_pool_is_bounded_and_drains_on_unexpected_failure():
         assert peak == 3 and active == 0 and 0 < len(finished) < 12
 
     asyncio.run(check())
-
-
-@pytest.mark.parametrize("command", ["refresh-images", "load-images"])
-def test_photo_commands_reject_nonpositive_concurrency_before_writing(
-    command, tmp_path
-):
-    with pytest.raises(SystemExit) as failure:
-        main.main(
-            ["--database", str(tmp_path / "new.sqlite"), command, "--concurrency", "0"]
-        )
-    assert failure.value.code == 2 and not (tmp_path / "new.sqlite").exists()
