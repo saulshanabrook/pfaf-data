@@ -5,7 +5,7 @@ The data and images are subject to [PFAF’s copyright terms](https://pfaf.org/u
 
 [Browse the dataset](https://saulshanabrook.github.io/pfaf-data/) or
 [open the plants table in Datasette Lite](https://lite.datasette.io/?url=https%3A%2F%2Fsaulshanabrook.github.io%2Fpfaf-data%2Fdata.sqlite&metadata=https%3A%2F%2Fsaulshanabrook.github.io%2Fpfaf-data%2Fmetadata.json#/data/plants).
-Lite downloads the roughly 45 MiB database into your browser on first use.
+Lite downloads the database into your browser on first use.
 
 ## Setup
 
@@ -32,6 +32,7 @@ Start with a separate database for a small live check:
 uv run python main.py --database pfaf-smoke.sqlite create-tables
 uv run python main.py --database pfaf-smoke.sqlite search-plants --query 'Abelia triflora' --limit 1
 uv run python main.py --database pfaf-smoke.sqlite load-plants --plant 'Abelia triflora'
+uv run python main.py --database pfaf-smoke.sqlite load-images --limit 2
 ```
 
 To refresh the checked-in database:
@@ -40,15 +41,24 @@ To refresh the checked-in database:
 # Create missing tables and apply additive schema updates; existing rows survive.
 uv run python main.py create-tables
 uv run python main.py search-plants
-uv run python main.py load-plants
-uv run python main.py load-images
+uv run python main.py refresh-images --force --concurrency 4
+uv run python main.py load-images --concurrency 4
 ```
 
-Use `load-plants --force` to revisit already populated records, or `--plant NAME`
-to select a specific plant. Inspect command help for limits and cache options.
-A full refresh makes thousands of requests; the HTTP cache and bounded
-concurrency reduce repeat traffic. Image downloads are a separate opt-in step.
-Review the resulting database and image changes before committing them.
+`refresh-images` updates photo URLs and credits without changing descriptions.
+Without `--force`, it resumes unchecked plants and failed refreshes, including
+checkpoints for pages with no photos. Use `--plant NAME` or `--limit N` for a
+bounded check. `--concurrency` defaults to two.
+
+`load-images` reuses files only after checking their recorded SHA-256 and full
+image decoding. Downloads retry transient failures up to three times and replace
+files atomically. Individual failures are recorded while later items continue;
+the commands exit non-zero if any item failed. Rerun to retry failures, or use
+`load-images --force` to fetch every current URL again.
+
+Run `load-plants` to update descriptions too. `--force` revisits populated records;
+the global `--no-cache` option bypasses the 24-hour HTTP cache. Cached responses
+retain their original fetch timestamp. Review data and image changes before committing.
 
 The search uses the current alphabetical index and discovers pagination from
 the response rather than assuming a fixed page count. Detail parsing tolerates
@@ -63,9 +73,9 @@ stored in SQLite.
   one retained legacy record, plus normalized uses, care information, and image sources.
   The index was refreshed on October 17, 2026, adding 292 names. Most descriptions
   still date from the original 2022 snapshot; three representative detail pages
-  were freshly verified during this update.
-- `images/`: downloaded image files. Some historical path mappings need an
-  independent audit before these files can be treated as a verified image archive.
+  were refreshed with the October 17 index update.
+- `images/`: downloaded photo files, with URL ownership and validation results
+  recorded in `image_downloads`.
 - `metadata.json`: attribution and Datasette configuration.
 - `index.html` and `.nojekyll`: the GitHub Pages landing page and static publishing configuration.
 - `tests/`: offline parsing, migration, database integrity, and Datasette checks.
@@ -76,8 +86,14 @@ is retained for compatibility. `source_url` records the detail URL and
 timestamp means the refresh date is unknown. Adding columns does not imply that
 all existing records have been fetched again.
 
+`images_scraped_at` and `images_error` track photo refreshes independently of
+`details_scraped_at`. `plant_images` holds source URLs, credits, and local paths;
+`image_downloads` records per-URL hashes, fetch times, and download status.
+
 The `plant_data` view combines plant details with JSON arrays of uses, images,
-and care information. It is useful for export and local Datasette queries.
+and care information. Its `images` entries contain the original `url`, credit
+text in `source`, and local `path`, and include only successful source checks
+and verified downloads.
 The default Lite link opens `plants`, which avoids the browser query timeout
 seen with the original aggregate view.
 
@@ -116,8 +132,10 @@ The existing GitHub Pages deployment publishes **`main`, `/`**. Merging a PR
 updates the landing page, metadata, database, and images through that existing
 deployment. There are no hosting credentials or server processes to provision.
 The landing page sends Datasette Lite the database and metadata URLs from the
-same deployment, so forks work too. PFAF remains the source of the remote images
-referenced by the database.
+same deployment, so forks work too. Downloaded photos are published directly as
+static files under `images/`. Resolve each `plant_data.images` entry's `path`
+against the Pages root to obtain its local photo URL; `url` preserves the PFAF
+source location and `source` preserves its credit text.
 
 CI tests the committed database that Pages will serve. Keep database migrations
 and the migrated `data.sqlite` in the same PR. Before merging, check CI; after
@@ -131,7 +149,5 @@ merging, check the repository’s **Pages build and deployment** and open the
 - Introduce numbered schema migrations and record scrape runs, parser versions,
   and source hashes alongside the per-record URL and timestamp.
 - Add FTS5 search for names and descriptive text if local search needs improve.
-- Audit historical image paths against downloaded bytes before repairing
-  mappings. A matching filename alone does not establish image identity.
 - Publish dated database releases with checksums so consumers can pin a snapshot
   without downloading the image archive or repository history.

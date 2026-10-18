@@ -1,11 +1,14 @@
 """Check the committed payload used by the existing main:/ Pages deployment."""
 
 import asyncio
+import hashlib
 import json
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 from datasette.app import Datasette
+from PIL import Image, ImageSequence
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,3 +53,40 @@ def test_datasette_browse_and_json():
         assert {"datasette-gzip", "datasette-render-images"} <= plugins
 
     asyncio.run(check())
+
+
+def test_published_photo_archive():
+    with sqlite3.connect((ROOT / "data.sqlite").as_uri() + "?mode=ro", uri=True) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM plants "
+                "WHERE images_scraped_at IS NULL AND images_error IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        rows = con.execute(
+            "SELECT DISTINCT i.url, i.path, d.path, d.status, d.sha256, "
+            "d.fetched_at, d.error "
+            "FROM plant_images i JOIN plants p ON p.latin_name=i.plant "
+            "LEFT JOIN image_downloads d ON d.url=i.url "
+            "WHERE p.images_scraped_at IS NOT NULL AND p.images_error IS NULL"
+        ).fetchall()
+        assert rows
+        paths = {}
+        for url, path, asset_path, status, digest, fetched, error in rows:
+            assert path == asset_path
+            key = unicodedata.normalize("NFC", path).casefold()
+            assert paths.setdefault(key, url) == url
+            photo = ROOT / path
+            assert photo.resolve().is_relative_to((ROOT / "images").resolve()), url
+            assert status in {"ok", "error"}, url
+            if status == "error":
+                assert error, url
+                continue
+            assert error is None and fetched, url
+            assert hashlib.sha256(photo.read_bytes()).hexdigest() == digest, url
+            with Image.open(photo) as image:
+                image.verify()
+            with Image.open(photo) as image:
+                for frame in ImageSequence.Iterator(image):
+                    frame.load()

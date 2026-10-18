@@ -1,6 +1,6 @@
 {
   "title": "(unofficial) Plants for a Future Data",
-  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. details_scraped_at records individual detail refreshes and is null when the date is unknown.",
+  "description": "An unofficial PFAF snapshot. The plant index was refreshed on 2026-10-17; most descriptions date from 2022. Detail and photo refreshes have independent timestamps. plant_data includes verified photo downloads.",
   "source": "github.com/saulshanabrook/pfaf-data",
   "license_url": "https://pfaf.org/user/cmspage.aspx?pageid=136",
   "source_url": "https://github.com/saulshanabrook/pfaf-data",
@@ -11,7 +11,17 @@
           "columns": {
             "native_range": "The current PFAF Native Range section; found_in is retained for compatibility.",
             "source_url": "PFAF detail page used for this record.",
-            "details_scraped_at": "UTC ISO 8601 time of the last successful detail fetch. Null means unknown; cached responses do not advance this time."
+            "details_scraped_at": "UTC ISO 8601 time of the last successful detail fetch. Null means unknown; cached responses do not advance this time.",
+            "images_scraped_at": "UTC ISO 8601 time of the last successful photo metadata fetch, including pages with no photos. Independent of details_scraped_at.",
+            "images_error": "Last photo refresh error. Failed source checks are excluded from plant_data.images."
+          }
+        },
+        "image_downloads": {
+          "description": "Per-URL local paths, SHA-256 hashes, timestamps, and pending/ok/error download status. Only successful downloads from checked plant pages appear in plant_data.images."
+        },
+        "plant_data": {
+          "columns": {
+            "images": "JSON array of verified photo entries with original url, source credit, and local path relative to the published archive root."
           }
         }
       }
