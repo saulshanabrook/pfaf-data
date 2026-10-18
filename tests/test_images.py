@@ -700,3 +700,109 @@ def test_photo_page_accepts_empty_author_without_accepting_wrong_or_empty_title(
         soup.find(id="ContentPlaceHolder1_lbldisplatinname").string = title
         with pytest.raises(ValueError, match="returned title"):
             main.parse_plant_images(soup, name)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (asyncio.TimeoutError(), "TimeoutError"),
+        (ClientConnectionError(), "ClientConnectionError"),
+        (ClientConnectionError("connection reset"), "connection reset"),
+    ],
+)
+def test_bare_network_image_failure_has_message_and_later_download_succeeds(
+    archive, network, png, tmp_path, monkeypatch, capsys, error, message
+):
+    path = archive(["https://example.test/a.png", "https://example.test/b.png"])
+    session = network([error, error, error, png])
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(path),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "load-images",
+                "--concurrency",
+                "1",
+            ]
+        )
+    assert failure.value.code == 1
+    assert session.request.call_count == 4
+    assert sleep.await_args_list == [call(1), call(2)]
+    with sqlite3.connect(path) as con:
+        assert con.execute(
+            "SELECT status,error FROM image_downloads ORDER BY url"
+        ).fetchall() == [("error", message), ("ok", None)]
+    assert (
+        f"Failed image https://example.test/a.png: {message}" in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (asyncio.TimeoutError(), "TimeoutError"),
+        (ClientConnectionError(), "ClientConnectionError"),
+        (ClientConnectionError("connection reset"), "connection reset"),
+    ],
+)
+def test_bare_network_metadata_failure_has_message_and_later_plant_succeeds(
+    archive, network, tmp_path, monkeypatch, capsys, error, message
+):
+    path = archive(["https://example.test/old.png"])
+    with sqlite3.connect(path) as con:
+        row = dict(
+            zip(
+                main.SEARCH_COLUMNS,
+                [
+                    "Example beta",
+                    "Other",
+                    "Tree",
+                    2,
+                    "4-9",
+                    "M",
+                    "LM",
+                    "N",
+                    "M",
+                    1,
+                    1,
+                    1,
+                ],
+            )
+        )
+        main.record_plant_row(con, row)
+    html = b'<span id="ContentPlaceHolder1_lbldisplatinname">Example beta</span><span id="ContentPlaceHolder1_lblFamily">Family</span><table id="ContentPlaceHolder1_tblPlantImges"></table>'
+    session = network([error, error, error, html])
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+    with pytest.raises(SystemExit) as failure:
+        main.main(
+            [
+                "--database",
+                str(path),
+                "--cache",
+                str(tmp_path / "cache.sqlite"),
+                "refresh-images",
+                "--force",
+                "--concurrency",
+                "1",
+            ]
+        )
+    assert failure.value.code == 1
+    assert session.request.call_count == 4
+    assert sleep.await_args_list == [call(1), call(2)]
+    with sqlite3.connect(path) as con:
+        assert con.execute(
+            "SELECT images_error FROM plants ORDER BY latin_name"
+        ).fetchall() == [(message,), (None,)]
+        assert con.execute(
+            "SELECT images_scraped_at FROM plants WHERE latin_name='Example beta'"
+        ).fetchone()[0]
+        assert (
+            con.execute("SELECT url FROM plant_images").fetchone()[0]
+            == "https://example.test/old.png"
+        )
+    assert f"Failed Example alba: {message}" in capsys.readouterr().out

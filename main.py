@@ -889,13 +889,14 @@ async def run_network_command(
                         and error.status in RETRYABLE_HTTP_STATUSES
                     ):
                         raise
+                    message = str(error) or type(error).__name__
                     if args.command == "refresh-images":
                         with con:
                             con.execute(
                                 "UPDATE plants SET images_error=? WHERE latin_name=?",
-                                (str(error), name),
+                                (message, name),
                             )
-                    console.print(f"Failed {name}: {error}", markup=False)
+                    console.print(f"Failed {name}: {message}", markup=False)
                     failed.append(name)
                     return
                 updated += 1
@@ -984,12 +985,13 @@ async def run_network_command(
                     ClientResponseError,
                     asyncio.TimeoutError,
                 ) as error:
+                    message = str(error) or type(error).__name__
                     with con:
                         con.execute(
                             "UPDATE image_downloads SET status='error',error=? WHERE url=?",
-                            (str(error), url),
+                            (message, url),
                         )
-                    console.print(f"Failed image {url}: {error}", markup=False)
+                    console.print(f"Failed image {url}: {message}", markup=False)
                     failed.append(url)
 
             await run_workers(
