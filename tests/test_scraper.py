@@ -137,9 +137,9 @@ def test_optional_sections_can_be_absent(plant_page):
         "txtCultivationDetails",
         "lblCarbFarm",
         "tblIcons",
-        "tblPlantImges",
     ):
         plant_page.find(id=f"ContentPlaceHolder1_{suffix}").decompose()
+    plant_page.find(id="ContentPlaceHolder1_tblPlantImges").clear()
     details = main.parse_plant_page(plant_page, "Example alba")
     assert details.values["edible_uses"] == ""
     assert not details.care and not details.images
@@ -183,10 +183,9 @@ def test_detail_refresh_is_atomic_and_relations_do_not_duplicate(con, plant_page
     main.record_plant_details(con, "Example alba", details)
     main.record_plant_details(con, "Example alba", details)
     assert con.execute("SELECT count(*) FROM plant_images").fetchone()[0] == 1
-    assert (
-        con.execute("SELECT path FROM plant_images").fetchone()[0]
-        == "images/Example alba.jpg"
-    )
+    assert con.execute("SELECT path FROM plant_images").fetchone()[
+        0
+    ] == main.image_path("https://pfaf.org/Admin/PlantImages/Example%20alba.jpg")
     assert con.execute("SELECT count(*) FROM plant_uses").fetchone()[0] == 6
     previous = con.execute("SELECT summary FROM plants").fetchone()[0]
     details.values["summary"] = "Should roll back"
@@ -232,6 +231,7 @@ def test_view_exposes_cares_without_multiplying_uses_or_images(con, plant_page):
     details = main.parse_plant_page(plant_page, "Example alba")
     details.care["Moist soil"] = "https://pfaf.org/moist.png"
     main.record_plant_details(con, "Example alba", details)
+    con.execute("UPDATE image_downloads SET status='ok'")
     cares, images, uses = con.execute(
         "SELECT cares, images, uses FROM plant_data"
     ).fetchone()
@@ -311,7 +311,7 @@ def test_repeated_pagination_page_is_an_error(monkeypatch):
 def test_fetch_timestamp_tracks_source_age_not_cache_read_time(plant_page, from_cache):
     cached_at = datetime(2020, 1, 2, 3, 4, 5)
     response = MagicMock(from_cache=from_cache, created_at=cached_at)
-    response.text = AsyncMock(return_value=str(plant_page))
+    response.read = AsyncMock(return_value=str(plant_page).encode())
     context = AsyncMock()
     context.__aenter__.return_value = response
     session = MagicMock()
@@ -447,7 +447,7 @@ def test_request_recovers_after_transient_connection_failures(
     plant_page, monkeypatch, error
 ):
     response = MagicMock(from_cache=False)
-    response.text = AsyncMock(return_value=str(plant_page))
+    response.read = AsyncMock(return_value=str(plant_page).encode())
     context = AsyncMock()
     context.__aenter__.return_value = response
     session = MagicMock()

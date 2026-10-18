@@ -4,25 +4,33 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import os
 import re
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape, unescape
+from io import BytesIO
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlencode, urljoin, urlparse
+from tempfile import NamedTemporaryFile
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 
 from aiohttp import (
     ClientConnectionError,
+    ClientPayloadError,
     ClientResponseError,
     ClientTimeout,
+    DummyCookieJar,
     TCPConnector,
 )
 from aiohttp_client_cache import CachedSession, SQLiteBackend
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag, UnicodeDammit
+from PIL import Image, ImageSequence, UnidentifiedImageError
 from rich.console import Console
-from rich.progress import track
+from rich.progress import Progress
 
 SITE_URL = "https://pfaf.org/user/"
 SEARCH_URL = urljoin(SITE_URL, "DatabaseSearhResult.aspx")
@@ -76,6 +84,8 @@ TABLES = {
         "native_range": "TEXT",
         "source_url": "TEXT",
         "details_scraped_at": "TEXT",
+        "images_scraped_at": "TEXT",
+        "images_error": "TEXT",
     },
     "plant_care": {
         "plant": "TEXT NOT NULL",
@@ -95,6 +105,16 @@ TABLES = {
         "source": "TEXT",
         "FOREIGN KEY(plant)": "REFERENCES plants",
         "PRIMARY KEY(plant, url)": "",
+    },
+    "image_downloads": {
+        "url": "TEXT PRIMARY KEY NOT NULL",
+        "path": "TEXT UNIQUE NOT NULL",
+        "status": "TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ok','error'))",
+        "sha256": "TEXT",
+        "byte_size": "INTEGER",
+        "fetched_at": "TEXT",
+        "attempted_at": "TEXT",
+        "error": "TEXT",
     },
     "plant_uses": {
         "plant": "TEXT NOT NULL",
@@ -119,8 +139,10 @@ VIEWS = {
 SELECT p.*,
     (SELECT json_group_array(care)
        FROM plant_care WHERE plant = p.latin_name) AS cares,
-    (SELECT json_group_array(json_object('url', url, 'source', source))
-       FROM plant_images WHERE plant = p.latin_name) AS images,
+    (SELECT json_group_array(json_object('url', i.url, 'source', i.source, 'path', d.path))
+       FROM plant_images i JOIN image_downloads d ON d.url = i.url
+       WHERE i.plant = p.latin_name AND d.status = 'ok'
+         AND p.images_scraped_at IS NOT NULL AND p.images_error IS NULL) AS images,
     (SELECT json_group_array(json_object('category', category, 'name', name))
        FROM plant_uses WHERE plant = p.latin_name) AS uses
 FROM plants AS p
@@ -186,6 +208,12 @@ USE_SECTIONS = {
 
 
 @dataclass
+class FetchedContent:
+    body: bytes
+    fetched_at: datetime
+
+
+@dataclass
 class FetchedPage:
     soup: BeautifulSoup
     fetched_at: datetime
@@ -197,6 +225,153 @@ class PlantDetails:
     care: dict[str, str]
     images: dict[str, str | None]
     uses: dict[str, dict[str, str]]
+
+
+def image_path(url: str) -> str:
+    """Give each exact source URL its own portable filename, without basename collisions."""
+    suffix = PurePosixPath(unquote(urlparse(url).path)).suffix.lower()
+    if suffix not in {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".avif",
+    }:
+        suffix = ".img"
+    return str(
+        PurePosixPath("images") / (hashlib.sha256(url.encode()).hexdigest() + suffix)
+    )
+
+
+def parse_page_html(body: bytes | str) -> BeautifulSoup:
+    """Repair PFAF's unescaped filename apostrophes using the original attribute text."""
+    text = UnicodeDammit(body).unicode_markup
+    if text is None:
+        raise ValueError("PFAF returned undecodable HTML")
+    table_pattern = re.compile(
+        r"""(<table\b[^>]*\bid\s*=\s*['"]ContentPlaceHolder1_tblPlantImges['"][^>]*>)(.*?)(</table\s*>)""",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if "ContentPlaceHolder1_tblPlantImges" in text and not table_pattern.search(text):
+        raise ValueError("PFAF photo table is truncated")
+    # A quote inside a filename is not the closing delimiter unless followed by
+    # an actual attribute assignment or the end of the img tag.
+    src_pattern = re.compile(
+        r"""(<img\b[^>]*?\ssrc\s*=\s*)(['"])([^<>]*?)\2(?=\s+[A-Za-z_:][-A-Za-z0-9_:.]*\s*=|\s*/?>)""",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def repair_table(match):
+        def repair_src(source):
+            return source[1] + '"' + escape(unescape(source[3]), quote=True) + '"'
+
+        return match[1] + src_pattern.sub(repair_src, match[2]) + match[3]
+
+    return BeautifulSoup(table_pattern.sub(repair_table, text), "lxml")
+
+
+def parse_plant_images(soup: BeautifulSoup, latin_name: str) -> dict[str, str | None]:
+    """Validate plant identity and preserve image-to-credit pairing by table column."""
+    title = soup.find(id="ContentPlaceHolder1_lbldisplatinname")
+    title_text = title.get_text(" ", strip=True) if title else ""
+    if title_text != latin_name and not title_text.startswith(f"{latin_name} - "):
+        raise ValueError(
+            f"Requested {latin_name!r}, but PFAF returned title {title_text!r}"
+        )
+    if soup.find(id="ContentPlaceHolder1_lblFamily") is None:
+        raise ValueError(f"PFAF overview is missing for {latin_name!r}")
+    table = soup.find(id="ContentPlaceHolder1_tblPlantImges")
+    if table is None:
+        raise ValueError(f"PFAF photo table is missing for {latin_name!r}")
+    images, pending = {}, {}
+    for row in table.find_all("tr", recursive=False):
+        for column, cell in enumerate(row.find_all(["td", "th"], recursive=False)):
+            photos = cell.find_all("img")
+            if photos:
+                pending[column] = []
+                for photo in photos:
+                    if not photo.get("src"):
+                        raise ValueError(
+                            f"PFAF photo has no source URL for {latin_name!r}"
+                        )
+                    url = quote(
+                        urljoin(PLANT_URL, photo["src"]), safe=":/?&=%+;,@!$()*[]#"
+                    )
+                    if (
+                        PurePosixPath(urlparse(url).path)
+                        .name.lower()
+                        .startswith("noplantimage")
+                    ):
+                        continue
+                    images[url] = None
+                    pending[column].append(url)
+            elif source := cell.get_text(" ", strip=True):
+                for url in pending.get(column, []):
+                    images[url] = source
+    return images
+
+
+def record_plant_images(
+    con: sqlite3.Connection,
+    latin_name: str,
+    images: dict[str, str | None],
+    fetched_at: datetime,
+) -> None:
+    """Atomically replace source-listed photos without changing other plant details."""
+    con.execute("SAVEPOINT pfaf_images")
+    try:
+        result = con.execute(
+            "UPDATE plants SET images_scraped_at=?,images_error=NULL WHERE latin_name=?",
+            (fetched_at.isoformat(timespec="seconds"), latin_name),
+        )
+        if result.rowcount != 1:
+            raise ValueError(f"Plant {latin_name!r} is absent; run search-plants first")
+        con.execute("DELETE FROM plant_images WHERE plant=?", (latin_name,))
+        for url, source in images.items():
+            path = image_path(url)
+            con.execute(
+                "INSERT INTO image_downloads(url,path) VALUES(?,?) ON CONFLICT(url) DO NOTHING",
+                (url, path),
+            )
+            con.execute(
+                "INSERT INTO plant_images(plant,url,path,source) VALUES(?,?,?,?)",
+                (latin_name, url, path, source),
+            )
+    except BaseException:
+        con.execute("ROLLBACK TO SAVEPOINT pfaf_images")
+        con.execute("RELEASE SAVEPOINT pfaf_images")
+        raise
+    else:
+        con.execute("RELEASE SAVEPOINT pfaf_images")
+
+
+def validate_image(body: bytes) -> tuple[str, int]:
+    """Verify format integrity and decode every frame before trusting or publishing bytes."""
+    try:
+        with Image.open(BytesIO(body)) as image:
+            image.verify()
+        with Image.open(BytesIO(body)) as image:
+            for frame in ImageSequence.Iterator(image):
+                frame.load()
+    except (
+        OSError,
+        ValueError,
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+    ) as error:
+        raise ValueError(f"Invalid image: {error}") from error
+    return hashlib.sha256(body).hexdigest(), len(body)
+
+
+async def request_page(
+    session: CachedSession, method: str, url: str, **kwargs
+) -> FetchedPage:
+    content = await request_content(session, method, url, **kwargs)
+    return FetchedPage(parse_page_html(content.body), content.fetched_at)
 
 
 def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
@@ -212,6 +387,7 @@ def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
                 "plant_care",
                 "plant_images",
                 "plant_uses",
+                "image_downloads",
                 "care",
                 "uses",
                 "plants",
@@ -223,9 +399,22 @@ def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
             )
             con.execute(f"CREATE TABLE IF NOT EXISTS {name} ({definitions})")
         columns = {row[1] for row in con.execute("PRAGMA table_info(plants)")}
-        for name in ("native_range", "source_url", "details_scraped_at"):
+        for name in (
+            "native_range",
+            "source_url",
+            "details_scraped_at",
+            "images_scraped_at",
+            "images_error",
+        ):
             if name not in columns:
                 con.execute(f"ALTER TABLE plants ADD COLUMN {name} TEXT")
+        for (url,) in con.execute("SELECT DISTINCT url FROM plant_images").fetchall():
+            path = image_path(url)
+            con.execute(
+                "INSERT INTO image_downloads(url,path) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET path=excluded.path",
+                (url, path),
+            )
+            con.execute("UPDATE plant_images SET path=? WHERE url=?", (path, url))
         for name, query in VIEWS.items():
             con.execute(f"CREATE VIEW {name} AS {query}")
     except BaseException:
@@ -301,14 +490,7 @@ def parse_plant_page(
     soup: BeautifulSoup, latin_name: str, fetched_at: datetime | None = None
 ) -> PlantDetails:
     """Parse optional sections independently; fail closed on the wrong plant."""
-    title = soup.find(id="ContentPlaceHolder1_lbldisplatinname")
-    title_text = title.get_text(" ", strip=True) if title else ""
-    if title_text != latin_name and not title_text.startswith(f"{latin_name} - "):
-        raise ValueError(
-            f"Requested {latin_name!r}, but PFAF returned title {title_text!r}"
-        )
-    if soup.find(id="ContentPlaceHolder1_lblFamily") is None:
-        raise ValueError(f"PFAF overview is missing for {latin_name!r}")
+    images = parse_plant_images(soup, latin_name)
     values = {}
     for column, suffix in DETAIL_FIELDS.items():
         node = soup.find(id=f"ContentPlaceHolder1_{suffix}")
@@ -349,28 +531,6 @@ def parse_plant_page(
             name = (icon.get("title") or icon.get("alt") or "").strip()
             if name:
                 care[name] = urljoin(PLANT_URL, icon["src"])
-
-    images = {}
-    image_table = soup.find(id="ContentPlaceHolder1_tblPlantImges")
-    last_image = None
-    if image_table:
-        for row in image_table.find_all("tr", recursive=False):
-            photos = row.find_all("img", src=True)
-            if photos:
-                for photo in photos:
-                    url = urljoin(PLANT_URL, photo["src"])
-                    if (
-                        urlparse(url)
-                        .path.rsplit("/", 1)[-1]
-                        .lower()
-                        .startswith("noplantimage")
-                    ):
-                        last_image = None
-                        continue
-                    last_image = url
-                    images[url] = None
-            elif last_image and (source := row.get_text(" ", strip=True)):
-                images[last_image] = source
 
     uses = {
         category: {}
@@ -445,21 +605,11 @@ def record_plant_details(
             "INSERT INTO plant_care VALUES (?, ?)",
             [(latin_name, name) for name in details.care],
         )
-        con.execute("DELETE FROM plant_images WHERE plant=?", (latin_name,))
-        con.executemany(
-            "INSERT INTO plant_images(plant, url, path, source) VALUES (?, ?, ?, ?)",
-            [
-                (
-                    latin_name,
-                    url,
-                    str(
-                        PurePosixPath("images")
-                        / PurePosixPath(unquote(urlparse(url).path)).name
-                    ),
-                    source,
-                )
-                for url, source in details.images.items()
-            ],
+        record_plant_images(
+            con,
+            latin_name,
+            details.images,
+            datetime.fromisoformat(str(details.values["details_scraped_at"])),
         )
         con.executemany(
             "INSERT INTO uses(category, name, description) VALUES (?, ?, ?) "
@@ -481,15 +631,15 @@ def record_plant_details(
         )
 
 
-async def request_page(
+async def request_content(
     session: CachedSession, method: str, url: str, **kwargs
-) -> FetchedPage:
+) -> FetchedContent:
     """Use finite timeouts and bounded retries for transient upstream failures."""
     for attempt in range(3):
         try:
             async with session.request(method, url, **kwargs) as response:
                 response.raise_for_status()
-                soup = BeautifulSoup(await response.text(), "lxml")
+                body = await response.read()
                 fetched_at = (
                     response.created_at
                     if getattr(response, "from_cache", False)
@@ -498,9 +648,10 @@ async def request_page(
                 # aiohttp-client-cache stores created_at as naive UTC.
                 if fetched_at.tzinfo is None:
                     fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-                return FetchedPage(soup, fetched_at)
+                return FetchedContent(body, fetched_at)
         except (
             ClientConnectionError,
+            ClientPayloadError,
             ClientResponseError,
             asyncio.TimeoutError,
         ) as error:
@@ -560,12 +711,38 @@ async def get_all_search_pages(
         page, page_number = next_page, page_number + 1
 
 
+async def run_workers(items: list, handler, concurrency: int, description: str) -> None:
+    """Bound in-flight work and cancel all workers if an unexpected error escapes."""
+    iterator = iter(items)
+    with Progress(console=console) as progress:
+        task = progress.add_task(description, total=len(items))
+
+        async def worker():
+            for item in iterator:
+                await handler(item)
+                progress.advance(task)
+
+        workers = [
+            asyncio.create_task(worker()) for _ in range(min(concurrency, len(items)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for worker_task in workers:
+                worker_task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
+
 async def run_network_command(
     args: argparse.Namespace, con: sqlite3.Connection
 ) -> None:
     async with CachedSession(
         headers={"User-Agent": USER_AGENT},
-        connector=TCPConnector(limit_per_host=2),
+        cookie_jar=DummyCookieJar()
+        if args.command in {"refresh-images", "load-images"}
+        else None,
+        connector=TCPConnector(limit_per_host=getattr(args, "concurrency", 2)),
         timeout=ClientTimeout(total=60),
         cache=SQLiteBackend(
             str(args.cache), expire_after=86400, disabled=args.no_cache
@@ -581,7 +758,7 @@ async def run_network_command(
                         console.print(f"Saved {count} search results")
                         return
             console.print(f"Saved {count} search results")
-        elif args.command == "load-plants":
+        elif args.command in {"load-plants", "refresh-images"}:
             conditions, parameters = [], []
             if args.plant:
                 conditions.append(
@@ -589,7 +766,11 @@ async def run_network_command(
                 )
                 parameters.extend(args.plant)
             if not args.force:
-                conditions.append("details_scraped_at IS NULL")
+                conditions.append(
+                    "details_scraped_at IS NULL"
+                    if args.command == "load-plants"
+                    else "(images_scraped_at IS NULL OR images_error IS NOT NULL)"
+                )
             query = "SELECT latin_name FROM plants"
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
@@ -608,49 +789,150 @@ async def run_network_command(
                         f"Plants absent from database: {sorted(missing)!r}; run search-plants first"
                     )
             updated, failed = 0, []
-            for name in track(plants, description="Fetching plants", console=console):
+
+            async def refresh_plant(name):
+                nonlocal updated
                 try:
                     page = await request_page(
                         session, "GET", PLANT_URL, params={"LatinName": name}
                     )
-                    record_plant_details(
-                        con, name, parse_plant_page(page.soup, name, page.fetched_at)
-                    )
-                except (ValueError, ClientResponseError) as error:
-                    if (
-                        isinstance(error, ClientResponseError)
+                    if args.command == "refresh-images":
+                        record_plant_images(
+                            con,
+                            name,
+                            parse_plant_images(page.soup, name),
+                            page.fetched_at,
+                        )
+                    else:
+                        record_plant_details(
+                            con,
+                            name,
+                            parse_plant_page(page.soup, name, page.fetched_at),
+                        )
+                except (
+                    ValueError,
+                    ClientResponseError,
+                    ClientConnectionError,
+                    ClientPayloadError,
+                    asyncio.TimeoutError,
+                ) as error:
+                    if args.command == "load-plants" and (
+                        not isinstance(error, (ValueError, ClientResponseError))
+                        or isinstance(error, ClientResponseError)
                         and error.status in RETRYABLE_HTTP_STATUSES
                     ):
                         raise
+                    if args.command == "refresh-images":
+                        with con:
+                            con.execute(
+                                "UPDATE plants SET images_error=? WHERE latin_name=?",
+                                (str(error), name),
+                            )
                     console.print(f"Failed {name}: {error}", markup=False)
                     failed.append(name)
-                    continue
+                    return
                 updated += 1
+
+            await run_workers(
+                plants,
+                refresh_plant,
+                getattr(args, "concurrency", 1),
+                "Fetching plants",
+            )
             console.print(f"Updated {updated} plants")
             if failed:
                 raise ValueError(
                     f"Failed to update {len(failed)} plants: {', '.join(failed)}"
                 )
         elif args.command == "load-images":
-            images = [
-                (url, args.database.parent / path)
-                for url, path in con.execute(
-                    "SELECT DISTINCT url, path FROM plant_images"
-                )
-            ]
-            images = [(url, path) for url, path in images if not path.exists()]
-            if args.limit:
-                images = images[: args.limit]
-            for url, path in track(
-                images, description="Downloading images", console=console
-            ):
-                # Avoid storing a second copy of every downloaded image in SQLite.
-                async with session.disabled(), session.get(url) as response:
-                    response.raise_for_status()
-                    body = await response.read()
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(body)
-            console.print(f"Downloaded {len(images)} images")
+            rows = con.execute("""SELECT d.url,d.path,d.status,d.sha256
+                FROM image_downloads d WHERE EXISTS (
+                    SELECT 1 FROM plant_images i JOIN plants p ON p.latin_name=i.plant
+                    WHERE i.url=d.url AND p.images_scraped_at IS NOT NULL AND p.images_error IS NULL)
+                ORDER BY d.url""").fetchall()
+            downloaded, reused, failed = 0, 0, []
+            pending = []
+            for row in rows:
+                url, relative, status, expected_hash = row
+                if not args.force and status == "ok" and expected_hash:
+                    try:
+                        actual_hash, _ = validate_image(
+                            (args.database.parent / relative).read_bytes()
+                        )
+                        if actual_hash == expected_hash:
+                            reused += 1
+                            continue
+                    except (OSError, ValueError):
+                        pass
+                pending.append(row)
+                if args.limit and len(pending) >= args.limit:
+                    break
+
+            async def download_image(row):
+                nonlocal downloaded
+                url, relative, status, expected_hash = row
+                path = args.database.parent / relative
+                with con:
+                    con.execute(
+                        "UPDATE image_downloads SET status='pending',attempted_at=?,error=NULL WHERE url=?",
+                        (datetime.now(timezone.utc).isoformat(timespec="seconds"), url),
+                    )
+                try:
+                    async with session.disabled():
+                        content = await request_content(session, "GET", url)
+                    digest, size = validate_image(content.body)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = None
+                    try:
+                        with NamedTemporaryFile(
+                            dir=path.parent,
+                            prefix=f".{path.name}.",
+                            suffix=".tmp",
+                            delete=False,
+                        ) as output:
+                            temporary = Path(output.name)
+                            output.write(content.body)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        temporary.replace(path)
+                    finally:
+                        if temporary is not None:
+                            temporary.unlink(missing_ok=True)
+                    with con:
+                        con.execute(
+                            "UPDATE image_downloads SET status='ok',sha256=?,byte_size=?,fetched_at=?,error=NULL WHERE url=?",
+                            (
+                                digest,
+                                size,
+                                content.fetched_at.isoformat(timespec="seconds"),
+                                url,
+                            ),
+                        )
+                    downloaded += 1
+                except (
+                    ValueError,
+                    OSError,
+                    ClientConnectionError,
+                    ClientPayloadError,
+                    ClientResponseError,
+                    asyncio.TimeoutError,
+                ) as error:
+                    with con:
+                        con.execute(
+                            "UPDATE image_downloads SET status='error',error=? WHERE url=?",
+                            (str(error), url),
+                        )
+                    console.print(f"Failed image {url}: {error}", markup=False)
+                    failed.append(url)
+
+            await run_workers(
+                pending, download_image, args.concurrency, "Downloading images"
+            )
+            console.print(
+                f"Downloaded {downloaded} images; reused {reused} verified images; failed {len(failed)}"
+            )
+            if failed:
+                raise ValueError(f"Failed to download {len(failed)} images")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -686,6 +968,16 @@ def main(argv: list[str] | None = None) -> None:
         default="%",
         help="Public Latin-name search query (default: all names)",
     )
+    refresh = commands.add_parser(
+        "refresh-images",
+        help="Refresh only photo metadata, independent of plant details",
+    )
+    refresh.add_argument(
+        "--plant", action="append", help="Only this exact Latin name; may be repeated"
+    )
+    refresh.add_argument(
+        "--force", action="store_true", help="Refresh already checked photo metadata"
+    )
     load = commands.add_parser("load-plants", help="Fetch plant detail pages")
     load.add_argument(
         "--plant", action="append", help="Only this exact Latin name; may be repeated"
@@ -696,7 +988,19 @@ def main(argv: list[str] | None = None) -> None:
     images = commands.add_parser(
         "load-images", help="Download missing images alongside the database"
     )
-    for command in (search, load, images):
+    images.add_argument(
+        "--force",
+        action="store_true",
+        help="Download all current URLs again, even verified files",
+    )
+    for command in (refresh, images):
+        command.add_argument(
+            "--concurrency",
+            type=int,
+            default=2,
+            help="Maximum simultaneous requests (default: 2)",
+        )
+    for command in (search, load, refresh, images):
         command.add_argument(
             "--limit", type=int, help="Maximum number of records to process"
         )
@@ -710,6 +1014,8 @@ def main(argv: list[str] | None = None) -> None:
         return
     if getattr(args, "limit", None) is not None and args.limit < 1:
         parser.error("--limit must be positive")
+    if getattr(args, "concurrency", 1) < 1:
+        parser.error("--concurrency must be positive")
     try:
         with closing(sqlite3.connect(args.database)) as con:
             con.execute("PRAGMA foreign_keys = ON")
@@ -723,6 +1029,7 @@ def main(argv: list[str] | None = None) -> None:
     except (
         ValueError,
         ClientConnectionError,
+        ClientPayloadError,
         ClientResponseError,
         asyncio.TimeoutError,
         sqlite3.Error,
