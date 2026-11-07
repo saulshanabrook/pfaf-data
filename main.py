@@ -66,6 +66,7 @@ TABLES = {
         # From detail page paragraphs
         "summary": "TEXT",
         "physical_characteristics": "TEXT",
+        "width": "REAL",
         "synonyms": "TEXT",
         "habitats_section": "TEXT",
         "edible_uses": "TEXT",
@@ -219,7 +220,7 @@ class FetchedPage:
 
 @dataclass
 class PlantDetails:
-    values: dict[str, str | int | None]
+    values: dict[str, str | int | float | None]
     care: dict[str, str]
     images: dict[str, str | None]
     uses: dict[str, dict[str, str]]
@@ -410,9 +411,23 @@ def create_tables(con: sqlite3.Connection, force: bool = False) -> None:
             "details_scraped_at",
             "images_scraped_at",
             "images_error",
+            "width",
         ):
             if name not in columns:
-                con.execute(f"ALTER TABLE plants ADD COLUMN {name} TEXT")
+                con.execute(
+                    f"ALTER TABLE plants ADD COLUMN {name} {TABLES['plants'][name]}"
+                )
+        if "width" not in columns:
+            con.executemany(
+                "UPDATE plants SET width=? WHERE latin_name=?",
+                [
+                    (width, name)
+                    for name, text in con.execute(
+                        "SELECT latin_name, physical_characteristics FROM plants"
+                    )
+                    if (width := parse_plant_width(text)) is not None
+                ],
+            )
         con.execute("CREATE INDEX IF NOT EXISTS plant_images_url ON plant_images(url)")
         for name, query in VIEWS.items():
             con.execute(f"CREATE VIEW {name} AS {query}")
@@ -485,6 +500,17 @@ def prose_without_glossary(section: Tag | None) -> str:
     return re.sub(r"\s+([,.;:!?])", r"\1", text).strip()
 
 
+def parse_plant_width(text: str | None) -> float | None:
+    """Read metres only from PFAF's explicit height-by-width growth clause."""
+    match = re.search(
+        r"\bgrowing to\s+\d+(?:\.\d+)?\s*m\s*(?:\([^)]*\)\s*)?"
+        r"by\s+(\d+(?:\.\d+)?)\s*m\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    return float(match[1]) if match else None
+
+
 def parse_plant_page(
     soup: BeautifulSoup, latin_name: str, fetched_at: datetime | None = None
 ) -> PlantDetails:
@@ -494,6 +520,7 @@ def parse_plant_page(
     for column, suffix in DETAIL_FIELDS.items():
         node = soup.find(id=f"ContentPlaceHolder1_{suffix}")
         values[column] = " ".join(node.stripped_strings) if node else ""
+    values["width"] = parse_plant_width(values["physical_characteristics"])
     values["conservation_status"] = (
         values["conservation_status"]
         .removeprefix("IUCN Red List of Threatened Plants Status :")

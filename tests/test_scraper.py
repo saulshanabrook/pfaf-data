@@ -65,13 +65,16 @@ def test_discovery_updates_all_search_fields_without_losing_details(con):
     assert plant["height"] == 3.5
     assert plant["medicinal_rating"] is None
     main.record_plant_row(con, plant)
-    con.execute("UPDATE plants SET family='Preserved family'")
+    con.execute("UPDATE plants SET family='Preserved family', width=1.25")
     plant.update(common_name="Changed name", shade="N")
     main.record_plant_row(con, plant)
-    assert con.execute("SELECT common_name, shade, family FROM plants").fetchone() == (
+    assert con.execute(
+        "SELECT common_name, shade, family, width FROM plants"
+    ).fetchone() == (
         "Changed name",
         "N",
         "Preserved family",
+        1.25,
     )
 
 
@@ -105,6 +108,7 @@ def test_detail_fields_nested_prose_and_current_native_range(plant_page):
         == "Example Island."
     )
     assert details.values["summary"] == "A nested summary."
+    assert details.values["width"] == 0.75
     assert details.values["edibility_rating"] == 4
     assert (
         details.values["edible_uses"]
@@ -126,6 +130,44 @@ def test_detail_fields_nested_prose_and_current_native_range(plant_page):
     assert details.images == {
         "https://pfaf.org/Admin/PlantImages/Example%20alba.jpg": "Example photographer"
     }
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (
+            "Abelia triflora is a deciduous Shrub growing to 3.5 m (11ft) by 3 m (9ft) at a medium rate.",
+            3.0,
+        ),
+        ("A herb growing to 0.5 m (1ft 8in) by 0.25 m (0ft 10in).", 0.25),
+        ("A tree growing to 10 m by 5 m.", 5.0),
+        ("A shrub growing to 2\u00a0m (6ft)\nby\u00a00.75\u00a0m (2ft).", 0.75),
+        ("A plant growing to 0 m (0ft) by 0.1 m (0ft 4in).", 0.1),
+        ("A tree growing to 5 m (16ft) at a slow rate.", None),
+        ("A tree growing to 5 m. Leaves measure 2 m by 3 m.", None),
+        ("A plant growing to 2 m by 3 ft.", None),
+        ("A plant growing to 2 m by 1-2 m.", None),
+        ("A plant growing to 2 m by unknown m.", None),
+        ("A plant growing to 2 m by -1 m.", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_width_uses_only_explicit_metric_plant_dimensions(text, expected):
+    assert main.parse_plant_width(text) == expected
+
+
+def test_detail_refresh_clears_width_when_source_omits_it(con, plant_page):
+    main.record_plant_row(con, main.parse_search_page(search_html())[0])
+    main.record_plant_details(
+        con, "Example alba", main.parse_plant_page(plant_page, "Example alba")
+    )
+    assert con.execute("SELECT width FROM plant_data").fetchone() == (0.75,)
+    plant_page.find(id="ContentPlaceHolder1_lblPhystatment").decompose()
+    main.record_plant_details(
+        con, "Example alba", main.parse_plant_page(plant_page, "Example alba")
+    )
+    assert con.execute("SELECT width FROM plant_data").fetchone() == (None,)
 
 
 def test_optional_sections_can_be_absent(plant_page):
@@ -201,7 +243,7 @@ def test_additive_migration_preserves_legacy_rows_and_returns_empty_arrays():
         columns = {
             name: kind
             for name, kind in main.TABLES["plants"].items()
-            if name not in {"native_range", "source_url", "details_scraped_at"}
+            if name not in {"native_range", "source_url", "details_scraped_at", "width"}
         }
         definitions = ", ".join(f"{name} {kind}" for name, kind in columns.items())
         database.execute(f"CREATE TABLE plants ({definitions})")
@@ -213,6 +255,52 @@ def test_additive_migration_preserves_legacy_rows_and_returns_empty_arrays():
         ).fetchone()
         assert row[:3] == ("Example alba", None, None)
         assert [json.loads(value) for value in row[3:]] == [[], [], []]
+
+
+def test_width_migration_backfills_stored_prose_and_preserves_existing_fields():
+    with sqlite3.connect(":memory:") as database:
+        columns = {
+            name: kind
+            for name, kind in main.TABLES["plants"].items()
+            if name != "width"
+        }
+        database.execute(
+            "CREATE TABLE plants ("
+            + ", ".join(f"{name} {kind}" for name, kind in columns.items())
+            + ")"
+        )
+        for plant in main.parse_search_page(
+            search_html(("Example alba", "Example beta", "Example gamma"))
+        ):
+            main.record_plant_row(database, plant)
+        database.execute(
+            "UPDATE plants SET physical_characteristics=?, details_scraped_at=? WHERE latin_name=?",
+            (
+                "A shrub growing to 3.5 m (11ft) by 0.75 m (2ft 5in).",
+                "2022-04-20T00:00:00+00:00",
+                "Example alba",
+            ),
+        )
+        database.execute(
+            "UPDATE plants SET physical_characteristics=? WHERE latin_name=?",
+            ("A tree growing to 5 m (16ft).", "Example beta"),
+        )
+        before = database.execute("SELECT * FROM plants ORDER BY latin_name").fetchall()
+        for _ in range(2):
+            main.create_tables(database)
+        assert (
+            database.execute(
+                f"SELECT {', '.join(columns)} FROM plants ORDER BY latin_name"
+            ).fetchall()
+            == before
+        )
+        assert database.execute(
+            "SELECT latin_name, width, typeof(width) FROM plant_data ORDER BY latin_name"
+        ).fetchall() == [
+            ("Example alba", 0.75, "real"),
+            ("Example beta", None, "null"),
+            ("Example gamma", None, "null"),
+        ]
 
 
 def test_force_recreation_with_populated_foreign_keys(con, plant_page):

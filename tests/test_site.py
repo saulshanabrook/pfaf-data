@@ -24,7 +24,19 @@ def test_published_database():
         assert count >= 8796
         assert con.execute("SELECT count(*) FROM plant_data").fetchone()[0] == count
         cols = {row[1] for row in con.execute("PRAGMA table_info(plant_data)")}
-        assert {"native_range", "source_url", "details_scraped_at", "cares"} <= cols
+        assert {
+            "width",
+            "native_range",
+            "source_url",
+            "details_scraped_at",
+            "cares",
+        } <= cols
+        assert con.execute(
+            "SELECT height, width FROM plants WHERE latin_name='Abelia triflora'"
+        ).fetchone() == (3.5, 3.0)
+        assert con.execute(
+            "SELECT width FROM plants WHERE latin_name='Abelmoschus esculentus'"
+        ).fetchone() == (None,)
         assert (ROOT / ".nojekyll").is_file()
         assert "metadata=" in (ROOT / "index.html").read_text()
 
@@ -43,11 +55,18 @@ def test_datasette_browse_and_json():
         row = response.json()["rows"][0]
         assert {
             "latin_name",
+            "width",
             "native_range",
             "details_scraped_at",
             "cares",
         } <= row.keys()
         assert isinstance(json.loads(row["cares"]), list)
+        for table in ("plants", "plant_data"):
+            response = await ds.client.get(
+                f"/data/{table}.json?latin_name=Abelia+triflora&_shape=objects"
+            )
+            assert response.status_code == 200
+            assert response.json()["rows"][0]["width"] == 3.0
         response = await ds.client.get("/-/plugins.json")
         plugins = {plugin["name"] for plugin in response.json()}
         assert {"datasette-gzip", "datasette-render-images"} <= plugins

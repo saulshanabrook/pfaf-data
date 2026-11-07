@@ -86,6 +86,12 @@ is retained for compatibility. `source_url` records the detail URL and
 timestamp means the refresh date is unknown. Adding columns does not imply that
 all existing records have been fetched again.
 
+`height` and `width` are in metres. Width is extracted from the explicit
+height-by-width growth statement in `physical_characteristics`; it is null when
+that statement does not supply a metric width. Schema migration backfills width
+from stored text without changing detail refresh timestamps. The current
+snapshot has widths for 3,649 of 8,796 plants.
+
 `images_scraped_at` and `images_error` track photo refreshes independently of
 `details_scraped_at`. `plant_images` holds source URLs, credits, and local paths;
 `image_downloads` records per-URL hashes, fetch times, and download status.
